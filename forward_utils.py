@@ -135,7 +135,7 @@ prompt_state = [prompt_normal, prompt_abnormal]
 prompt_templates = prompt["prompt_templates"]
 
 
-def get_adapted_single_class_text_embedding(model, dataset_name, class_name, device):
+def get_adapted_single_class_text_embedding(model, dataset_name, class_name, device, adapt_text=True):
     if class_name == "object":
         real_name = class_name
     else:
@@ -151,7 +151,7 @@ def get_adapted_single_class_text_embedding(model, dataset_name, class_name, dev
             for template in prompt_templates:
                 prompted_sentence.append(template.format(s))
         prompted_sentence = tokenize(prompted_sentence).to(device)
-        class_embeddings = model.encode_text(prompted_sentence)
+        class_embeddings = model.encode_text(prompted_sentence, adapt_text=adapt_text)
         class_embeddings = class_embeddings / class_embeddings.norm(
             dim=-1, keepdim=True
         )
@@ -162,7 +162,7 @@ def get_adapted_single_class_text_embedding(model, dataset_name, class_name, dev
     return text_features
 
 
-def get_adapted_single_sentence_text_embedding(model, dataset_name, class_name, device):
+def get_adapted_single_sentence_text_embedding(model, dataset_name, class_name, device, adapt_text=True):
     assert class_name in CLASS_NAMES[dataset_name], (
         f"class_name {class_name} not found; available class_names: {CLASS_NAMES[dataset_name]}"
     )
@@ -175,18 +175,18 @@ def get_adapted_single_sentence_text_embedding(model, dataset_name, class_name, 
             for template in prompt_templates:
                 prompted_sentence.append(template.format(s))
         prompted_sentence = tokenize(prompted_sentence).to(device)
-        class_embeddings = model.encode_text(prompted_sentence)
+        class_embeddings = model.encode_text(prompted_sentence, adapt_text=adapt_text)
         class_embeddings = F.normalize(class_embeddings, dim=-1)
         text_features.append(class_embeddings)
     text_features = torch.cat(text_features, dim=0).to(device)
     return text_features
 
 
-def get_adapted_text_embedding(model, dataset_name, device):
+def get_adapted_text_embedding(model, dataset_name, device, adapt_text=True):
     ret_dict = {}
     for class_name in CLASS_NAMES[dataset_name]:
         text_features = get_adapted_single_class_text_embedding(
-            model, dataset_name, class_name, device
+            model, dataset_name, class_name, device, adapt_text=adapt_text
         )
         ret_dict[class_name] = text_features
     return ret_dict

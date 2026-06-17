@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .adapter_modules import SimpleAdapter, SimpleProj
+from .adapter_modules import PatchGraphBlock, SimpleAdapter, SimpleProj
+
 
 class AdaptedCLIP(nn.Module):
     def __init__(
@@ -13,6 +14,11 @@ class AdaptedCLIP(nn.Module):
         image_adapt_until: int = 6,
         levels: list = [6, 12, 18, 24],
         relu: bool = True,
+        enable_patch_graph: bool = True,
+        patch_graph_k: int = 8,
+        patch_graph_alpha: float = 0.7,
+        patch_graph_residual_weight: float = 0.2,
+        patch_graph_use_spatial: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -23,6 +29,7 @@ class AdaptedCLIP(nn.Module):
         self.t_w = text_adapt_weight
         self.i_w = image_adapt_weight
         self.levels = levels
+        self.enable_patch_graph = enable_patch_graph
 
         layer_adapters = nn.ModuleList(
             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
@@ -31,11 +38,23 @@ class AdaptedCLIP(nn.Module):
             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
         )
         det_proj = SimpleProj(1024, 768, relu)
+        patch_graph = (
+            PatchGraphBlock(
+                dim=768,
+                k=patch_graph_k,
+                alpha=patch_graph_alpha,
+                residual_weight=patch_graph_residual_weight,
+                use_spatial=patch_graph_use_spatial,
+            )
+            if enable_patch_graph
+            else nn.Identity()
+        )
         self.image_adapter = nn.ModuleDict(
             {
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
                 "det_proj": det_proj,
+                "patch_graph": patch_graph,
             }
         )
         self.text_adapter = nn.ModuleList(
@@ -51,6 +70,12 @@ class AdaptedCLIP(nn.Module):
         for p in self.text_adapter.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def image_trainable_parameters(self):
+        yield from self.image_adapter.parameters()
+
+    def text_trainable_parameters(self):
+        yield from self.text_adapter.parameters()
 
     def forward_original(self, x, modality="visual"):
         if modality == "visual":
@@ -106,8 +131,11 @@ class AdaptedCLIP(nn.Module):
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
+        seg_tokens = [self.image_adapter["patch_graph"](t) for t in seg_tokens]
         seg_tokens = [F.normalize(t, dim=-1) for t in seg_tokens]
+
         det_token = self.image_adapter["det_proj"](tokens[-1])
+        det_token = self.image_adapter["patch_graph"](det_token)
         det_token = F.normalize(det_token, dim=-1).mean(1)
         return seg_tokens, det_token
 
@@ -136,10 +164,5 @@ class AdaptedCLIP(nn.Module):
                 x = self.t_w * adapt_out + (1 - self.t_w) * x
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clipmodel.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = self.text_adapter[-1](x[torch.arange(x.shape[0]), text.argmax(dim=-1)])
-        # x = (
-            # x[torch.arange(x.shape[0]), text.argmax(dim=-1)]
-            # @ self.clipmodel.text_projection
-        # )
         return x

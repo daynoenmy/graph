@@ -46,6 +46,20 @@ python test.py --save_path $save_path --dataset $dataset
 # (Optional) we provide bash script for training and evaluating all the datasets
 bash scripts.sh
 ```
+
+### Medical zero-shot architecture extension
+
+This fork adds a CP-CLIP inspired core-periphery alignment head and a feature-disentanglement head on top of AA-CLIP adapters. They are enabled by default in `train.py` and `test.py`. Use the same CP/disentanglement arguments for training and evaluation when overriding defaults.
+
+```bash
+python train.py --dataset Brain --shot 32 --save_path ckpt/medical_cp_fd \
+  --cp_core_ratio 0.7 --cp_layers 2 --disentangle_weight 0.1
+
+python test.py --dataset Brain --save_path ckpt/medical_cp_fd \
+  --cp_core_ratio 0.7 --cp_layers 2
+```
+
+To recover the original AA-CLIP adapter behavior, pass `--disable_cp --disable_disentangle`.
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.
 
 ## Additional Discussion

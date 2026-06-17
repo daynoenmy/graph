@@ -1,7 +1,7 @@
-BASE_PATH = "/data/wenxinma"
+BASE_PATH = "/home/sunhan"
 DATA_PATH = {
-    "Brain": f"{BASE_PATH}/data/MedAD/Brain_AD",
-    "Liver": f"{BASE_PATH}/data/MedAD/Liver_AD",
+    "Brain": f"{BASE_PATH}/dataset/Brain_AD",
+    "Liver": f"{BASE_PATH}/dataset/Liver_AD",
     "Retina": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
     "Colon_clinicDB": f"{BASE_PATH}/data/Colon/CVC-ClinicDB",
     "Colon_colonDB": f"{BASE_PATH}/data/Colon/CVC-ColonDB",

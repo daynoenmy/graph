@@ -123,6 +123,11 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
+    parser.add_argument("--patch_graph_k", type=int, default=8)
+    parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
+    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
+    parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
     # ========================================================
@@ -157,6 +162,11 @@ def main():
         text_adapt_until=args.text_adapt_until,
         image_adapt_until=args.image_adapt_until,
         relu=args.relu,
+        enable_patch_graph=not args.disable_patch_graph,
+        patch_graph_k=args.patch_graph_k,
+        patch_graph_alpha=args.patch_graph_alpha,
+        patch_graph_residual_weight=args.patch_graph_residual_weight,
+        patch_graph_use_spatial=not args.disable_patch_graph_spatial,
     ).to(device)
     model.eval()
     # load checkpoints if exists
@@ -164,16 +174,16 @@ def main():
     assert len(text_file) >= 0, "text adapter checkpoint not found"
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
-        model.text_adapter.load_state_dict(checkpoint["text_adapter"])
+        model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
         adapt_text = True
     else:
         adapt_text = False
 
-    files = sorted(glob(args.save_path + "/image_adapter_*.pth"))
+    files = sorted(glob(args.save_path + "/image_adapter_2.pth"))
     assert len(files) > 0, "image adapter checkpoint not found"
     for file in files:
         checkpoint = torch.load(file)
-        model.image_adapter.load_state_dict(checkpoint["image_adapter"])
+        model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         test_epoch = checkpoint["epoch"]
         logger.info("-----------------------------------------------")
         logger.info("load model from epoch %d", test_epoch)
@@ -196,7 +206,7 @@ def main():
                 )
             else:
                 text_embeddings = get_adapted_text_embedding(
-                    clip_model, args.dataset, device
+                    model, args.dataset, device, adapt_text=False
                 )
         # ========================================================
         df = DataFrame(

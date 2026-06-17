@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
-import ipdb
+
 from utils import setup_seed
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
@@ -84,16 +84,17 @@ def train_text_adapter(
                 ]
                 patch_features = [t + cls_token.unsqueeze(1) for t in patch_features]
             # calculate similarity and get prediction
+            loss = 0.0
             for f in patch_features:
                 # bs,patch_num,768
                 patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
-                loss = calculate_seg_loss(patch_preds, mask)
-                orthogonal_loss = (
-                    (epoch_text_feature[:, :, 0] * epoch_text_feature[:, :, 1])
-                    .sum(1)
-                    .mean()
-                ) ** 2
-                loss += orthogonal_loss * text_norm_weight
+                loss += calculate_seg_loss(patch_preds, mask)
+            orthogonal_loss = (
+                (epoch_text_feature[:, :, 0] * epoch_text_feature[:, :, 1])
+                .sum(1)
+                .mean()
+            ) ** 2
+            loss += orthogonal_loss * text_norm_weight
             # backward
             optimizer.zero_grad()
             loss.backward()
@@ -213,6 +214,11 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
+    parser.add_argument("--patch_graph_k", type=int, default=8)
+    parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
+    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
+    parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
     # ========================================================
@@ -257,16 +263,21 @@ def main():
         text_adapt_until=args.text_adapt_until,
         image_adapt_until=args.image_adapt_until,
         relu=args.relu,
+        enable_patch_graph=not args.disable_patch_graph,
+        patch_graph_k=args.patch_graph_k,
+        patch_graph_alpha=args.patch_graph_alpha,
+        patch_graph_residual_weight=args.patch_graph_residual_weight,
+        patch_graph_use_spatial=not args.disable_patch_graph_spatial,
     ).to(device)
     model.eval()
     # set optimizer
     text_optimizer = torch.optim.Adam(
-        model.text_adapter.parameters(),
+        model.text_trainable_parameters(),
         lr=args.text_lr,
         betas=(0.5, 0.999),
     )
     image_optimizer = torch.optim.Adam(
-        model.image_adapter.parameters(),
+        model.image_trainable_parameters(),
         lr=args.image_lr,
         betas=(0.5, 0.999),
     )
@@ -277,8 +288,11 @@ def main():
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
-        model.text_adapter.load_state_dict(checkpoint["text_adapter"])
-        text_optimizer.load_state_dict(checkpoint["text_optimizer"])
+        model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
+        try:
+            text_optimizer.load_state_dict(checkpoint["text_optimizer"])
+        except ValueError:
+            logger.info("skip text optimizer state because trainable parameters changed")
         text_start_epoch = checkpoint["epoch"]
         adapt_text = not (text_start_epoch == (args.text_epoch - 1))
     elif args.text_epoch == 0:
@@ -290,8 +304,11 @@ def main():
     if len(file) > 0:
         checkpoint = torch.load(file[0])
         image_start_epoch = checkpoint["epoch"]
-        model.image_adapter.load_state_dict(checkpoint["image_adapter"])
-        image_optimizer.load_state_dict(checkpoint["image_optimizer"])
+        model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
+        try:
+            image_optimizer.load_state_dict(checkpoint["image_optimizer"])
+        except ValueError:
+            logger.info("skip image optimizer state because trainable parameters changed")
     else:
         image_start_epoch = 0
     # ========================================================
@@ -338,7 +355,7 @@ def main():
     with torch.no_grad():
         if args.text_epoch == 0:
             text_embeddings = get_adapted_text_embedding(
-                clip_model, args.dataset, device
+                model, args.dataset, device, adapt_text=False
             )
         else:
             text_embeddings = get_adapted_text_embedding(model, args.dataset, device)
