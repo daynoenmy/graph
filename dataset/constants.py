@@ -133,16 +133,16 @@ REAL_NAMES = {
     },
 }
 PROMPTS = {
-    "prompt_normal": ["{}", "a {}", "the {}"],
+    "prompt_normal": ["{}", "a normal {}", "a healthy {}"],
     "prompt_abnormal": [
-        "a damaged {}",
-        "a broken {}",
-        "a {} with flaw",
-        "a {} with defect",
-        "a {} with damage",
+        "an abnormal {}",
+        "a pathological {}",
+        "a {} with lesion",
+        "a {} with abnormality",
+        "a {} with disease",
     ],
     "prompt_templates": [
         "{}.",
-        "a photo of {}.",
+        "a medical image of {}.",
     ],
 }
