@@ -26,65 +26,6 @@ class SimpleProj(nn.Module):
         return x
 
 
-class CPGeneratorLayer(nn.Module):
-    def __init__(self, dim=768, heads=8, mlp_ratio=4):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.ln_q = nn.LayerNorm(dim)
-        self.ln_ctx = nn.LayerNorm(dim)
-        self.ln_ffn = nn.LayerNorm(dim)
-        hidden_dim = int(dim * mlp_ratio)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, noise, context):
-        q = self.ln_q(noise)
-        ctx = self.ln_ctx(context)
-        attn_out, _ = self.cross_attn(q, ctx, ctx, need_weights=False)
-        noise = noise + attn_out
-        noise = noise + self.ffn(self.ln_ffn(noise))
-        return noise
-
-
-class CPTextAdapter(nn.Module):
-    def __init__(
-        self,
-        dim=768,
-        rank=32,
-        text_layers=3,
-        generator_layers=3,
-        heads=8,
-        beta_std=0.01,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.rank = rank
-        self.text_layers = text_layers
-        self.num_targets = text_layers * 2
-        self.noise = nn.Parameter(torch.randn(self.num_targets, dim) * beta_std)
-        self.layers = nn.ModuleList(
-            [CPGeneratorLayer(dim=dim, heads=heads) for _ in range(generator_layers)]
-        )
-        self.proj = nn.Linear(dim, dim * rank)
-        beta = torch.randn(text_layers, 2, rank, dim) * beta_std
-        self.register_buffer("beta", beta, persistent=True)
-
-    def forward(self, visual_context):
-        if visual_context.dim() == 2:
-            visual_context = visual_context.unsqueeze(0)
-        batch_size = visual_context.shape[0]
-        x = self.noise.unsqueeze(0).expand(batch_size, -1, -1)
-        for layer in self.layers:
-            x = layer(x, visual_context)
-        alpha = self.proj(x)
-        alpha = alpha.view(batch_size, self.text_layers, 2, self.dim, self.rank)
-        beta = self.beta.to(dtype=alpha.dtype, device=alpha.device)
-        return torch.matmul(alpha, beta.unsqueeze(0))
-
-
 def _build_knn_patch_graph(patch_features, k=8):
     x = F.normalize(patch_features, dim=-1)
     sim = x @ x.transpose(1, 2)

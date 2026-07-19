@@ -123,16 +123,6 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
-    parser.add_argument(
-        "--text_adapter_type",
-        type=str,
-        default="simple",
-        choices=["simple", "cp_clip"],
-        help="text adaptation mode used by the checkpoint",
-    )
-    parser.add_argument("--cp_rank", type=int, default=32)
-    parser.add_argument("--cp_generator_layers", type=int, default=3)
-    parser.add_argument("--cp_beta_std", type=float, default=0.01)
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
@@ -177,10 +167,6 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
-        text_adapter_type=args.text_adapter_type,
-        cp_rank=args.cp_rank,
-        cp_generator_layers=args.cp_generator_layers,
-        cp_beta_std=args.cp_beta_std,
     ).to(device)
     model.eval()
     # load checkpoints if exists
@@ -188,7 +174,7 @@ def main():
     assert len(text_file) >= 0, "text adapter checkpoint not found"
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
-        model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
+        model.text_adapter.load_state_dict(checkpoint["text_adapter"])
         adapt_text = True
     else:
         adapt_text = False

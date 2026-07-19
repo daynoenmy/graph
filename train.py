@@ -70,34 +70,18 @@ def train_text_adapter(
                 patch_features = [
                     t / t.norm(dim=-1, keepdim=True) for t in patch_features
                 ]
-                text_conditions = patch_features[-1]
                 patch_features = [t + cls_token.unsqueeze(1) for t in patch_features]
             # forward text
-            if getattr(adapted_model, "text_adapter_type", "simple") == "cp_clip":
-                epoch_text_feature = torch.stack(
-                    [
-                        get_adapted_single_class_text_embedding(
-                            adapted_model,
-                            dataset_name,
-                            class_name,
-                            device,
-                            visual_context=text_conditions[idx : idx + 1],
-                        )
-                        for idx, class_name in enumerate(class_names)
-                    ],
-                    dim=0,
+            epoch_text_feature_dict = {}
+            for class_name in list(set(class_names)):
+                text_embedding = get_adapted_single_class_text_embedding(
+                    adapted_model, dataset_name, class_name, device
                 )
-            else:
-                epoch_text_feature_dict = {}
-                for class_name in list(set(class_names)):
-                    text_embedding = get_adapted_single_class_text_embedding(
-                        adapted_model, dataset_name, class_name, device
-                    )
-                    epoch_text_feature_dict[class_name] = text_embedding
-                epoch_text_feature = torch.stack(
-                    [epoch_text_feature_dict[class_name] for class_name in class_names],
-                    dim=0,
-                )  # bs,768,2
+                epoch_text_feature_dict[class_name] = text_embedding
+            epoch_text_feature = torch.stack(
+                [epoch_text_feature_dict[class_name] for class_name in class_names],
+                dim=0,
+            )  # bs,768,2
             # calculate similarity and get prediction
             loss = 0.0
             for f in patch_features:
@@ -229,16 +213,6 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
-    parser.add_argument(
-        "--text_adapter_type",
-        type=str,
-        default="simple",
-        choices=["simple", "cp_clip"],
-        help="text adaptation mode; cp_clip follows the CP-CLIP-style conditional LoRA path",
-    )
-    parser.add_argument("--cp_rank", type=int, default=32)
-    parser.add_argument("--cp_generator_layers", type=int, default=3)
-    parser.add_argument("--cp_beta_std", type=float, default=0.01)
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
@@ -293,10 +267,6 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
-        text_adapter_type=args.text_adapter_type,
-        cp_rank=args.cp_rank,
-        cp_generator_layers=args.cp_generator_layers,
-        cp_beta_std=args.cp_beta_std,
     ).to(device)
     model.eval()
     # set optimizer
@@ -317,7 +287,7 @@ def main():
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
-        model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
+        model.text_adapter.load_state_dict(checkpoint["text_adapter"])
         try:
             text_optimizer.load_state_dict(checkpoint["text_optimizer"])
         except ValueError:
