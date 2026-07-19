@@ -2,7 +2,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .adapter_modules import PatchGraphBlock, SimpleAdapter, SimpleProj
-from .denoising import CLIPInputDenoiser
 
 
 class AdaptedCLIP(nn.Module):
@@ -20,11 +19,8 @@ class AdaptedCLIP(nn.Module):
         patch_graph_alpha: float = 0.7,
         patch_graph_residual_weight: float = 0.2,
         patch_graph_use_spatial: bool = True,
-        enable_input_denoiser: bool = False,
-        input_denoiser_channels: int = 1,
-        input_denoiser_width: int = 32,
-        input_denoiser_depth: int = 5,
-        input_denoiser_max_residual: float = 0.2,
+        patch_graph_feature_temperature: float = 0.2,
+        patch_graph_anomaly_temperature: float = 0.2,
         **kwargs,
     ):
         super().__init__()
@@ -36,7 +32,6 @@ class AdaptedCLIP(nn.Module):
         self.i_w = image_adapt_weight
         self.levels = levels
         self.enable_patch_graph = enable_patch_graph
-        self.enable_input_denoiser = enable_input_denoiser
 
         layer_adapters = nn.ModuleList(
             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
@@ -52,23 +47,14 @@ class AdaptedCLIP(nn.Module):
                 alpha=patch_graph_alpha,
                 residual_weight=patch_graph_residual_weight,
                 use_spatial=patch_graph_use_spatial,
+                feature_temperature=patch_graph_feature_temperature,
+                anomaly_temperature=patch_graph_anomaly_temperature,
             )
             if enable_patch_graph
             else nn.Identity()
         )
-        input_denoiser = (
-            CLIPInputDenoiser(
-                image_channels=input_denoiser_channels,
-                width=input_denoiser_width,
-                depth=input_denoiser_depth,
-                max_residual=input_denoiser_max_residual,
-            )
-            if enable_input_denoiser
-            else nn.Identity()
-        )
         self.image_adapter = nn.ModuleDict(
             {
-                "input_denoiser": input_denoiser,
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
                 "det_proj": det_proj,
@@ -80,11 +66,6 @@ class AdaptedCLIP(nn.Module):
             + [SimpleProj(768, 768, relu=True)]
         )
         self._init_weights_()
-        if self.enable_input_denoiser:
-            # _init_weights_ initializes every adapter matrix. Restore the
-            # student's zero-output tail so a newly enabled denoiser starts as
-            # an identity mapping and does not disturb pretrained CLIP inputs.
-            self.image_adapter["input_denoiser"].reset_identity()
 
     def _init_weights_(self):
         for p in self.image_adapter.parameters():
@@ -98,12 +79,9 @@ class AdaptedCLIP(nn.Module):
         yield from self.image_adapter.parameters()
 
     def image_adapter_parameters_without_input_denoiser(self):
-        for name, module in self.image_adapter.items():
-            if name != "input_denoiser":
-                yield from module.parameters()
-
-    def input_denoiser_parameters(self):
-        yield from self.image_adapter["input_denoiser"].parameters()
+        # Compatibility alias for checkpoints/scripts created before the
+        # diffusion-free noise-aware graph pipeline.
+        yield from self.image_adapter.parameters()
 
     def text_trainable_parameters(self):
         yield from self.text_adapter.parameters()
@@ -120,8 +98,7 @@ class AdaptedCLIP(nn.Module):
         else:
             raise ValueError("modality must be visual")
 
-    def forward(self, x):
-        x = self.image_adapter["input_denoiser"](x)
+    def _encode_pre_graph(self, x):
         x = self.image_encoder.conv1(x)
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)
@@ -151,7 +128,7 @@ class AdaptedCLIP(nn.Module):
                 adapt_out = (
                     adapt_out
                     * x.norm(dim=-1, keepdim=True)
-                    / adapt_out.norm(dim=-1, keepdim=True)
+                    / adapt_out.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                 )
                 x = self.i_w * adapt_out + (1 - self.i_w) * x
             if i + 1 in self.levels:
@@ -163,13 +140,102 @@ class AdaptedCLIP(nn.Module):
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
-        seg_tokens = [self.image_adapter["patch_graph"](t) for t in seg_tokens]
-        seg_tokens = [F.normalize(t, dim=-1) for t in seg_tokens]
-
         det_token = self.image_adapter["det_proj"](tokens[-1])
-        det_token = self.image_adapter["patch_graph"](det_token)
-        det_token = F.normalize(det_token, dim=-1).mean(1)
         return seg_tokens, det_token
+
+    @staticmethod
+    def _patch_uncertainty(primary_features, reference_features):
+        primary = F.normalize(primary_features, dim=-1)
+        reference = F.normalize(reference_features, dim=-1)
+        # Cosine distance is in [0, 2]; scale it to a bounded uncertainty.
+        return ((1.0 - (primary * reference).sum(dim=-1)) * 0.5).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _anomaly_probability(patch_features, text_embeddings):
+        if text_embeddings is None:
+            return None
+        features = F.normalize(patch_features, dim=-1)
+        if text_embeddings.ndim == 2:
+            text = F.normalize(text_embeddings, dim=0)
+            logits = features @ text
+        elif text_embeddings.ndim == 3:
+            if text_embeddings.shape[0] != patch_features.shape[0]:
+                raise ValueError("batched text embeddings must match image batch size")
+            text = F.normalize(text_embeddings, dim=1)
+            logits = torch.matmul(features, text)
+        else:
+            raise ValueError("text embeddings must have shape [D, 2] or [B, D, 2]")
+        if logits.shape[-1] != 2:
+            raise ValueError("normal/abnormal text embeddings must contain two anchors")
+        return torch.softmax(logits * 10.0, dim=-1)[..., 1]
+
+    def _refine_patch_features(self, features, uncertainty, anomaly_prob):
+        if not self.enable_patch_graph:
+            return F.normalize(features, dim=-1)
+        return self.image_adapter["patch_graph"](
+            features,
+            uncertainty=uncertainty,
+            anomaly_prob=anomaly_prob,
+        )
+
+    def forward(
+        self,
+        x,
+        reference_image=None,
+        text_embeddings=None,
+        return_aux=False,
+    ):
+        primary_seg, primary_det = self._encode_pre_graph(x)
+
+        if reference_image is None:
+            reference_seg = None
+            graph_seg = primary_seg
+            graph_det = primary_det
+            seg_uncertainty = [None for _ in primary_seg]
+            det_uncertainty = None
+        else:
+            # The perturbed branch is a stable teacher view. Gradients flow
+            # through the primary branch and graph parameters only, reducing
+            # memory while still enforcing noise consistency.
+            with torch.no_grad():
+                reference_seg, reference_det = self._encode_pre_graph(reference_image)
+            graph_seg = [
+                (primary + reference) * 0.5
+                for primary, reference in zip(primary_seg, reference_seg)
+            ]
+            graph_det = (primary_det + reference_det) * 0.5
+            seg_uncertainty = [
+                self._patch_uncertainty(primary, reference)
+                for primary, reference in zip(primary_seg, reference_seg)
+            ]
+            det_uncertainty = self._patch_uncertainty(primary_det, reference_det)
+
+        seg_anomaly_prob = [
+            self._anomaly_probability(features, text_embeddings)
+            for features in graph_seg
+        ]
+        det_anomaly_prob = self._anomaly_probability(graph_det, text_embeddings)
+        refined_seg = [
+            self._refine_patch_features(features, uncertainty, anomaly_prob)
+            for features, uncertainty, anomaly_prob in zip(
+                graph_seg, seg_uncertainty, seg_anomaly_prob
+            )
+        ]
+        refined_det = self._refine_patch_features(
+            graph_det, det_uncertainty, det_anomaly_prob
+        )
+        det_token = F.normalize(refined_det, dim=-1).mean(1)
+
+        if not return_aux:
+            return refined_seg, det_token
+        auxiliary = {
+            "primary_features": primary_seg,
+            "reference_features": reference_seg,
+            "graph_input_features": graph_seg,
+            "uncertainty": seg_uncertainty,
+            "anomaly_probability": seg_anomaly_prob,
+        }
+        return refined_seg, det_token, auxiliary
 
     def encode_text(self, text, adapt_text=True):
         if not adapt_text:

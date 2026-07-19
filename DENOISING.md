@@ -1,5 +1,10 @@
 # Self-supervised diffusion denoising
 
+> Legacy experiment: the current AA-CLIP training and evaluation path uses
+> feature-space noise uncertainty and does not load diffusion or student
+> denoiser checkpoints. The standalone stages below are retained only for
+> reproducing earlier denoising experiments.
+
 This repository implements the following offline training pipeline:
 
 ```text
@@ -131,58 +136,14 @@ The resulting checkpoint is:
 ckpt\ddti_denoising\student\input_denoiser.pth
 ```
 
-## 6. Train AA-CLIP with the frozen student
-
-Keep the input denoiser frozen for the first AA-CLIP experiment:
-
-```bat
-python train.py ^
-  --dataset DDTI ^
-  --training_mode full_shot ^
-  --save_path ckpt\add_text_denoised ^
-  --input_denoiser_checkpoint "%DENOISE_DIR%\student\input_denoiser.pth" ^
-  --input_denoiser_channels 1 ^
-  --input_denoiser_width 32 ^
-  --input_denoiser_depth 5
-```
-
-For a later task-aware fine-tuning experiment, add:
-
-```bat
-  --train_input_denoiser ^
-  --input_denoiser_lr 0.00001
-```
-
-CLIP remains frozen. Gradients are allowed to pass through CLIP to the input
-denoiser only when `--train_input_denoiser` is enabled.
-
-## 7. Test
-
-Use the same student architecture and checkpoint during evaluation:
-
-```bat
-python test.py ^
-  --dataset DDTI ^
-  --batch_size 16 ^
-  --save_path ckpt\add_text_denoised ^
-  --input_denoiser_checkpoint "%DENOISE_DIR%\student\input_denoiser.pth" ^
-  --input_denoiser_channels 1 ^
-  --input_denoiser_width 32 ^
-  --input_denoiser_depth 5
-```
-
-If the AA-CLIP image checkpoint contains jointly fine-tuned denoiser weights,
-those weights override the original student checkpoint during loading.
-
-## Suggested ablations
+## Legacy denoising ablations
 
 Evaluate downstream anomaly detection and localization, not only visual image
 quality:
 
 1. AA-CLIP baseline without input denoising.
 2. Blind-spot condition image as direct CLIP input.
-3. Distilled student frozen during AA-CLIP training.
-4. Distilled student jointly fine-tuned with the image adapters.
+3. Distilled deterministic student output.
 
 Inspect difference images around lesion boundaries to ensure that denoising did
 not remove diagnostically relevant structures.

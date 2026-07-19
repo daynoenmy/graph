@@ -10,16 +10,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 
-from utils import setup_seed
+from utils import make_medical_noise_view, setup_seed
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
-from model.denoising import load_student_checkpoint, read_student_checkpoint_config
 from dataset import get_dataset
 from forward_utils import (
     get_adapted_text_embedding,
     get_adapted_single_class_text_embedding,
     calculate_similarity_map,
     calculate_seg_loss,
+    calculate_noise_consistency_loss,
+    calculate_lesion_preservation_losses,
 )
 import warnings
 
@@ -126,24 +127,42 @@ def train_image_adapter(
     save_path: str,
     image_epoch: int,
     img_size: int,
+    dataset_name: str,
+    noise_severity: float,
+    noise_consistency_weight: float,
+    lesion_preservation_weight: float,
+    boundary_contrast_weight: float,
+    boundary_margin: float,
     logger: logging.Logger,
 ):
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
+        consistency_loss_list = []
+        preservation_loss_list = []
+        boundary_loss_list = []
         for input_data in tqdm(train_loader):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
             label = input_data["label"].to(device)
-            B, C, H, W = image.shape
             # forward text
             class_names = input_data["class_name"]
             epoch_text_feature = torch.stack(
                 [text_embeddings[class_name] for class_name in class_names], dim=0
             )
 
-            # forward image
-            patch_features, det_feature = model(image)
+            # The second, mask-aligned intensity view estimates patch noise
+            # sensitivity. It is not a reconstructed or pseudo-clean image.
+            reference_image = make_medical_noise_view(
+                image, dataset_name, severity=noise_severity
+            )
+            optimizer.zero_grad(set_to_none=True)
+            patch_features, det_feature, auxiliary = model(
+                image,
+                reference_image=reference_image,
+                text_embeddings=epoch_text_feature,
+                return_aux=True,
+            )
             # calculate similarity and get prediction
             loss = 0.0
             det_feature = det_feature.unsqueeze(1)
@@ -153,12 +172,34 @@ def train_image_adapter(
                 # text-image alignment
                 patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
                 loss += calculate_seg_loss(patch_preds, mask)  # backward
-            optimizer.zero_grad()
+            consistency_loss = calculate_noise_consistency_loss(
+                auxiliary["primary_features"],
+                auxiliary["reference_features"],
+                epoch_text_feature,
+            )
+            preservation_loss, boundary_loss = calculate_lesion_preservation_losses(
+                patch_features,
+                auxiliary["primary_features"],
+                mask,
+                boundary_margin=boundary_margin,
+            )
+            loss = loss + noise_consistency_weight * consistency_loss
+            loss = loss + lesion_preservation_weight * preservation_loss
+            loss = loss + boundary_contrast_weight * boundary_loss
             loss.backward()
             optimizer.step()
             loss_list.append(loss.item())
+            consistency_loss_list.append(consistency_loss.item())
+            preservation_loss_list.append(preservation_loss.item())
+            boundary_loss_list.append(boundary_loss.item())
             scheduler.step()
         logger.info(f"loss: {np.mean(loss_list)}")
+        logger.info(
+            "noise consistency: %.6f, lesion preservation: %.6f, boundary: %.6f",
+            np.mean(consistency_loss_list),
+            np.mean(preservation_loss_list),
+            np.mean(boundary_loss_list),
+        )
         # save checkpoint
         model_dict = {
             "epoch": epoch + 1,
@@ -219,45 +260,15 @@ def main():
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
     parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
-    parser.add_argument(
-        "--enable_input_denoiser",
-        action="store_true",
-        help="enable the distilled denoiser before the CLIP image encoder",
-    )
-    parser.add_argument(
-        "--input_denoiser_checkpoint",
-        type=str,
-        default=None,
-        help="checkpoint produced by train_denoiser.py train-student",
-    )
-    parser.add_argument(
-        "--train_input_denoiser",
-        action="store_true",
-        help="jointly fine-tune the distilled denoiser during image adaptation",
-    )
-    parser.add_argument("--input_denoiser_channels", type=int, choices=[1, 3], default=1)
-    parser.add_argument("--input_denoiser_width", type=int, default=32)
-    parser.add_argument("--input_denoiser_depth", type=int, default=5)
-    parser.add_argument("--input_denoiser_max_residual", type=float, default=0.2)
-    parser.add_argument("--input_denoiser_lr", type=float, default=0.00001)
+    parser.add_argument("--patch_graph_feature_temperature", type=float, default=0.2)
+    parser.add_argument("--patch_graph_anomaly_temperature", type=float, default=0.2)
+    parser.add_argument("--noise_severity", type=float, default=0.06)
+    parser.add_argument("--noise_consistency_weight", type=float, default=0.1)
+    parser.add_argument("--lesion_preservation_weight", type=float, default=0.1)
+    parser.add_argument("--boundary_contrast_weight", type=float, default=0.05)
+    parser.add_argument("--boundary_margin", type=float, default=0.2)
 
     args = parser.parse_args()
-    if args.input_denoiser_checkpoint is not None:
-        denoiser_config = read_student_checkpoint_config(
-            args.input_denoiser_checkpoint
-        )
-        args.input_denoiser_channels = denoiser_config.get(
-            "image_channels", args.input_denoiser_channels
-        )
-        args.input_denoiser_width = denoiser_config.get(
-            "width", args.input_denoiser_width
-        )
-        args.input_denoiser_depth = denoiser_config.get(
-            "depth", args.input_denoiser_depth
-        )
-        args.input_denoiser_max_residual = denoiser_config.get(
-            "max_residual", args.input_denoiser_max_residual
-        )
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -293,9 +304,6 @@ def main():
         require_pretrained=True,
     )
     clip_model.eval()
-    enable_input_denoiser = (
-        args.enable_input_denoiser or args.input_denoiser_checkpoint is not None
-    )
     model = AdaptedCLIP(
         clip_model=clip_model,
         text_adapt_weight=args.text_adapt_weight,
@@ -308,48 +316,21 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
-        enable_input_denoiser=enable_input_denoiser,
-        input_denoiser_channels=args.input_denoiser_channels,
-        input_denoiser_width=args.input_denoiser_width,
-        input_denoiser_depth=args.input_denoiser_depth,
-        input_denoiser_max_residual=args.input_denoiser_max_residual,
+        patch_graph_feature_temperature=args.patch_graph_feature_temperature,
+        patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
     ).to(device)
     model.eval()
     for parameter in model.clipmodel.parameters():
         parameter.requires_grad = False
-    if args.input_denoiser_checkpoint is not None:
-        load_student_checkpoint(
-            model.image_adapter["input_denoiser"],
-            args.input_denoiser_checkpoint,
-            map_location=device,
-        )
-        logger.info(
-            "loaded input denoiser from %s", args.input_denoiser_checkpoint
-        )
-    if enable_input_denoiser:
-        for parameter in model.input_denoiser_parameters():
-            parameter.requires_grad = args.train_input_denoiser
     # set optimizer
     text_optimizer = torch.optim.Adam(
         model.text_trainable_parameters(),
         lr=args.text_lr,
         betas=(0.5, 0.999),
     )
-    image_parameter_groups = [
-        {
-            "params": list(model.image_adapter_parameters_without_input_denoiser()),
-            "lr": args.image_lr,
-        }
-    ]
-    if enable_input_denoiser and args.train_input_denoiser:
-        image_parameter_groups.append(
-            {
-                "params": list(model.input_denoiser_parameters()),
-                "lr": args.input_denoiser_lr,
-            }
-        )
     image_optimizer = torch.optim.Adam(
-        image_parameter_groups,
+        model.image_trainable_parameters(),
+        lr=args.image_lr,
         betas=(0.5, 0.999),
     )
     # text_scheduler = MultiStepLR(text_optimizer, milestones=[400], gamma=0.1)
@@ -441,6 +422,12 @@ def main():
         start_epoch=image_start_epoch,
         save_path=args.save_path,
         img_size=args.img_size,
+        dataset_name=args.dataset,
+        noise_severity=args.noise_severity,
+        noise_consistency_weight=args.noise_consistency_weight,
+        lesion_preservation_weight=args.lesion_preservation_weight,
+        boundary_contrast_weight=args.boundary_contrast_weight,
+        boundary_margin=args.boundary_margin,
         logger=logger,
     )
 

@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -73,16 +75,38 @@ class PatchGraphBlock(nn.Module):
         alpha=0.7,
         residual_weight=0.2,
         use_spatial=True,
+        feature_temperature=0.2,
+        anomaly_temperature=0.2,
     ):
         super().__init__()
         self.k = k
         self.alpha = alpha
         self.residual_weight = residual_weight
         self.use_spatial = use_spatial
+        self.feature_temperature = feature_temperature
+        self.anomaly_temperature = anomaly_temperature
         self.proj = nn.Linear(dim, dim, bias=False)
         self.norm = nn.LayerNorm(dim)
+        initial_gate = min(max(float(residual_weight), 1e-4), 1.0 - 1e-4)
+        self.noise_gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.anomaly_gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.gate_bias = nn.Parameter(
+            torch.tensor(math.log(initial_gate / (1.0 - initial_gate)))
+        )
 
-    def forward(self, patch_features):
+    @staticmethod
+    def _prepare_patch_score(score, patch_features, name):
+        if score is None:
+            return patch_features.new_zeros(patch_features.shape[:2])
+        if score.ndim == 3 and score.shape[-1] == 1:
+            score = score.squeeze(-1)
+        if score.shape != patch_features.shape[:2]:
+            raise ValueError(
+                f"{name} must have shape {patch_features.shape[:2]}, got {score.shape}"
+            )
+        return score.to(device=patch_features.device, dtype=patch_features.dtype)
+
+    def forward(self, patch_features, uncertainty=None, anomaly_prob=None):
         batch_size, num_nodes, _ = patch_features.shape
         semantic_adj = _build_knn_patch_graph(patch_features, k=self.k)
         if self.use_spatial:
@@ -99,8 +123,58 @@ class PatchGraphBlock(nn.Module):
                 adj = semantic_adj
         else:
             adj = semantic_adj
-        adj = _normalize_adj(adj)
-        graph_features = adj @ patch_features
+
+        # Preserve the original fixed graph behavior for baseline ablations and
+        # checkpoints that do not provide a second noise view or text anchors.
+        if uncertainty is None and anomaly_prob is None:
+            normalized_adj = _normalize_adj(adj)
+            graph_features = normalized_adj @ patch_features
+            graph_features = self.norm(self.proj(graph_features))
+            out = (
+                (1 - self.residual_weight) * patch_features
+                + self.residual_weight * graph_features
+            )
+            return F.normalize(out, dim=-1)
+
+        uncertainty = self._prepare_patch_score(
+            uncertainty, patch_features, "uncertainty"
+        ).detach().clamp(0.0, 1.0)
+        anomaly_prob = self._prepare_patch_score(
+            anomaly_prob, patch_features, "anomaly_prob"
+        ).detach().clamp(0.0, 1.0)
+
+        normalized_features = F.normalize(patch_features, dim=-1)
+        similarity = normalized_features @ normalized_features.transpose(1, 2)
+        feature_affinity = torch.exp(
+            (similarity - 1.0) / max(self.feature_temperature, 1e-4)
+        )
+        anomaly_difference = (
+            anomaly_prob.unsqueeze(-1) - anomaly_prob.unsqueeze(1)
+        ).abs()
+        boundary_affinity = torch.exp(
+            -anomaly_difference / max(self.anomaly_temperature, 1e-4)
+        )
+
+        # A noisy source node should contribute less, while a noisy receiver
+        # may still request more information through its adaptive update gate.
+        source_reliability = (1.0 - uncertainty).unsqueeze(1).clamp_min(0.05)
+        weighted_adj = adj * feature_affinity * boundary_affinity * source_reliability
+        eye = torch.eye(
+            num_nodes, device=patch_features.device, dtype=patch_features.dtype
+        ).unsqueeze(0)
+        weighted_adj = weighted_adj + eye
+        transition = weighted_adj / weighted_adj.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+
+        graph_features = transition @ patch_features
         graph_features = self.norm(self.proj(graph_features))
-        out = (1 - self.residual_weight) * patch_features + self.residual_weight * graph_features
+        noise_scale = F.softplus(self.noise_gate_scale)
+        anomaly_scale = F.softplus(self.anomaly_gate_scale)
+        update_gate = torch.sigmoid(
+            noise_scale * uncertainty
+            - anomaly_scale * anomaly_prob
+            + self.gate_bias
+        ).unsqueeze(-1)
+        out = (1.0 - update_gate) * patch_features + update_gate * graph_features
         return F.normalize(out, dim=-1)

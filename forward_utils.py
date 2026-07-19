@@ -6,11 +6,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 from tqdm import tqdm
 from kornia.filters import gaussian_blur2d
-import ipdb
 from dataset.constants import CLASS_NAMES, REAL_NAMES, PROMPTS
 from model.tokenizer import tokenize
 from sklearn.metrics import roc_auc_score, average_precision_score
-import pandas as pd
 from dataset.constants import DATA_PATH
 from utils import cos_sim
 
@@ -229,6 +227,112 @@ def calculate_seg_loss(patch_preds, mask):
     loss += dice_loss(patch_preds[:, 0, :, :], 1 - mask)
     loss += dice_loss(patch_preds[:, 1, :, :], mask)
     return loss
+
+
+def _patch_text_logits(patch_features, text_embeddings, temperature=10.0):
+    features = F.normalize(patch_features, dim=-1)
+    if text_embeddings.ndim == 2:
+        text = F.normalize(text_embeddings, dim=0)
+        logits = features @ text
+    elif text_embeddings.ndim == 3:
+        text = F.normalize(text_embeddings, dim=1)
+        logits = torch.matmul(features, text)
+    else:
+        raise ValueError("text embeddings must have shape [D, 2] or [B, D, 2]")
+    return logits * temperature
+
+
+def calculate_noise_consistency_loss(
+    primary_features,
+    reference_features,
+    text_embeddings,
+):
+    """Symmetric prediction consistency across two intensity-noise views."""
+    if reference_features is None:
+        return primary_features[0].new_zeros(())
+    losses = []
+    for primary, reference in zip(primary_features, reference_features):
+        primary_log_prob = F.log_softmax(
+            _patch_text_logits(primary, text_embeddings), dim=-1
+        )
+        reference_log_prob = F.log_softmax(
+            _patch_text_logits(reference, text_embeddings), dim=-1
+        )
+        primary_prob = primary_log_prob.exp()
+        reference_prob = reference_log_prob.exp()
+        primary_to_reference = (
+            primary_prob * (primary_log_prob - reference_log_prob)
+        ).sum(dim=-1)
+        reference_to_primary = (
+            reference_prob * (reference_log_prob - primary_log_prob)
+        ).sum(dim=-1)
+        losses.append(0.5 * (primary_to_reference + reference_to_primary).mean())
+    return torch.stack(losses).mean()
+
+
+def calculate_lesion_preservation_losses(
+    refined_features,
+    primary_features,
+    mask,
+    boundary_margin=0.2,
+):
+    """Keep lesion features intact and inhibit smoothing across mask boundaries.
+
+    The mask is used only while adapting on the source training dataset. Target
+    datasets remain mask-free during model inference.
+    """
+    feature_losses = []
+    boundary_losses = []
+    for refined, primary in zip(refined_features, primary_features):
+        num_patches = refined.shape[1]
+        grid_size = int(num_patches**0.5)
+        if grid_size * grid_size != num_patches:
+            continue
+        patch_mask = F.interpolate(
+            mask.float(),
+            size=(grid_size, grid_size),
+            mode="nearest",
+        )[:, 0]
+        flat_mask = patch_mask.flatten(1)
+        # The pre-graph primary feature is the preservation target. Detaching
+        # it prevents the target and refined representation from drifting
+        # together to reduce this constraint trivially.
+        cosine_distance = 1.0 - F.cosine_similarity(
+            refined, primary.detach(), dim=-1
+        )
+        feature_losses.append(
+            (cosine_distance * flat_mask).sum()
+            / flat_mask.sum().clamp_min(1.0)
+        )
+
+        refined_grid = F.normalize(refined, dim=-1).view(
+            refined.shape[0], grid_size, grid_size, refined.shape[-1]
+        )
+        horizontal_boundary = (
+            patch_mask[:, :, 1:] != patch_mask[:, :, :-1]
+        ).float()
+        horizontal_distance = 1.0 - (
+            refined_grid[:, :, 1:] * refined_grid[:, :, :-1]
+        ).sum(dim=-1)
+        vertical_boundary = (
+            patch_mask[:, 1:, :] != patch_mask[:, :-1, :]
+        ).float()
+        vertical_distance = 1.0 - (
+            refined_grid[:, 1:, :] * refined_grid[:, :-1, :]
+        ).sum(dim=-1)
+        boundary_penalty = (
+            F.relu(boundary_margin - horizontal_distance) * horizontal_boundary
+        ).sum()
+        boundary_penalty = boundary_penalty + (
+            F.relu(boundary_margin - vertical_distance) * vertical_boundary
+        ).sum()
+        boundary_count = horizontal_boundary.sum() + vertical_boundary.sum()
+        boundary_losses.append(boundary_penalty / boundary_count.clamp_min(1.0))
+
+    zero = refined_features[0].new_zeros(())
+    feature_loss = torch.stack(feature_losses).mean() if feature_losses else zero
+    boundary_loss = torch.stack(boundary_losses).mean() if boundary_losses else zero
+    return feature_loss, boundary_loss
 
 
 # ================================================================================================

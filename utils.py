@@ -7,6 +7,10 @@ import kornia as K
 from torchvision import transforms
 
 
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)  # GPU随机种子确定
@@ -81,6 +85,87 @@ def add_gaussian_noise(x, scale=0.05):
     noised_img = (x + noise) * noise_mask
     noise_img = torch.where(noised_img > 0, noised_img, x)
     return noise_img
+
+
+def noise_model_for_dataset(dataset_name):
+    """Return the intensity-noise family used for a dataset.
+
+    The perturbations deliberately preserve spatial alignment with the mask.
+    They are not intended to reproduce an acquisition pipeline exactly; they
+    provide two views from which patch-level noise sensitivity can be measured.
+    """
+    name = dataset_name.lower()
+    if "brain" in name:
+        return "mri"
+    if "ddti" in name:
+        return "ultrasound"
+    if "liver" in name:
+        return "ct"
+    if "retina" in name:
+        return "retina"
+    if "colon" in name or "kvasir" in name:
+        return "endoscopy"
+    return "generic"
+
+
+@torch.no_grad()
+def make_medical_noise_view(image, dataset_name, severity=0.06):
+    """Create a mask-aligned, modality-aware perturbation of a CLIP input.
+
+    Args:
+        image: CLIP-normalized RGB tensor with shape ``[B, 3, H, W]``.
+        dataset_name: Name registered in ``dataset/constants.py``.
+        severity: Perturbation magnitude in raw ``[0, 1]`` intensity space.
+    """
+    if image.ndim != 4 or image.shape[1] != 3:
+        raise ValueError("image must have shape [B, 3, H, W]")
+    if severity < 0:
+        raise ValueError("noise severity must be non-negative")
+    if severity == 0:
+        return image.detach().clone()
+
+    mean = image.new_tensor(CLIP_MEAN).view(1, 3, 1, 1)
+    std = image.new_tensor(CLIP_STD).view(1, 3, 1, 1)
+    raw = (image * std + mean).clamp(0.0, 1.0)
+    noise_model = noise_model_for_dataset(dataset_name)
+
+    if noise_model == "mri":
+        # Magnitude-MR approximation: Rician corruption plus a smooth bias field.
+        noise_real = torch.randn_like(raw) * severity
+        noise_imag = torch.randn_like(raw) * severity
+        perturbed = torch.sqrt((raw + noise_real).square() + noise_imag.square())
+        field = torch.randn(
+            raw.shape[0], 1, 4, 4, device=raw.device, dtype=raw.dtype
+        )
+        field = F.interpolate(
+            field, size=raw.shape[-2:], mode="bilinear", align_corners=False
+        )
+        field = field / field.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        perturbed = perturbed * (1.0 + severity * field)
+    elif noise_model == "ultrasound":
+        # Multiplicative speckle with a small electronic-noise component.
+        speckle = torch.randn_like(raw) * (severity * 1.5)
+        perturbed = raw * (1.0 + speckle)
+        perturbed = perturbed + torch.randn_like(raw) * (severity * 0.25)
+    elif noise_model == "ct":
+        # Signal-dependent Gaussian approximation of quantum noise.
+        quantum_std = severity * torch.sqrt(raw.clamp_min(1.0 / 255.0))
+        perturbed = raw + torch.randn_like(raw) * quantum_std
+    elif noise_model == "retina":
+        shot_std = severity * torch.sqrt(raw.clamp_min(1.0 / 255.0))
+        perturbed = raw + torch.randn_like(raw) * shot_std
+        perturbed = perturbed + torch.randn_like(raw) * (severity * 0.2)
+    elif noise_model == "endoscopy":
+        illumination = torch.empty(
+            raw.shape[0], 1, 1, 1, device=raw.device, dtype=raw.dtype
+        ).uniform_(1.0 - severity, 1.0 + severity)
+        perturbed = raw * illumination
+        perturbed = perturbed + torch.randn_like(raw) * (severity * 0.35)
+    else:
+        perturbed = raw + torch.randn_like(raw) * severity
+
+    perturbed = perturbed.clamp(0.0, 1.0)
+    return (perturbed - mean) / std
 
 
 def cos_sim(a_norm, b_norm):

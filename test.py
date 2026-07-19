@@ -11,10 +11,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
-from utils import setup_seed, cos_sim
+from utils import make_medical_noise_view, setup_seed, cos_sim
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
-from model.denoising import load_student_checkpoint, read_student_checkpoint_config
 from dataset import get_dataset, DOMAINS
 from forward_utils import (
     get_adapted_text_embedding,
@@ -58,6 +57,7 @@ def get_predictions(
     device: str,
     img_size: int,
     dataset: str = "MVTec",
+    noise_severity: float = 0.06,
 ):
     masks = []
     labels = []
@@ -77,8 +77,15 @@ def get_predictions(
         file_names.extend(file_name)
         # get text
         epoch_text_feature = class_text_embeddings
-        # forward image
-        patch_features, det_feature = model(image)
+        # Estimate patch noise sensitivity from a second, mask-aligned view.
+        reference_image = make_medical_noise_view(
+            image, dataset, severity=noise_severity
+        )
+        patch_features, det_feature = model(
+            image,
+            reference_image=reference_image,
+            text_embeddings=epoch_text_feature,
+        )
         # calculate similarity and get prediction
         # cls_preds = []
         pred = det_feature @ epoch_text_feature
@@ -129,39 +136,11 @@ def main():
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
     parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
-    parser.add_argument(
-        "--enable_input_denoiser",
-        action="store_true",
-        help="enable the distilled denoiser before the CLIP image encoder",
-    )
-    parser.add_argument(
-        "--input_denoiser_checkpoint",
-        type=str,
-        default=None,
-        help="checkpoint produced by train_denoiser.py train-student",
-    )
-    parser.add_argument("--input_denoiser_channels", type=int, choices=[1, 3], default=1)
-    parser.add_argument("--input_denoiser_width", type=int, default=32)
-    parser.add_argument("--input_denoiser_depth", type=int, default=5)
-    parser.add_argument("--input_denoiser_max_residual", type=float, default=0.2)
+    parser.add_argument("--patch_graph_feature_temperature", type=float, default=0.2)
+    parser.add_argument("--patch_graph_anomaly_temperature", type=float, default=0.2)
+    parser.add_argument("--noise_severity", type=float, default=0.06)
 
     args = parser.parse_args()
-    if args.input_denoiser_checkpoint is not None:
-        denoiser_config = read_student_checkpoint_config(
-            args.input_denoiser_checkpoint
-        )
-        args.input_denoiser_channels = denoiser_config.get(
-            "image_channels", args.input_denoiser_channels
-        )
-        args.input_denoiser_width = denoiser_config.get(
-            "width", args.input_denoiser_width
-        )
-        args.input_denoiser_depth = denoiser_config.get(
-            "depth", args.input_denoiser_depth
-        )
-        args.input_denoiser_max_residual = denoiser_config.get(
-            "max_residual", args.input_denoiser_max_residual
-        )
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -187,9 +166,6 @@ def main():
         require_pretrained=True,
     )
     clip_model.eval()
-    enable_input_denoiser = (
-        args.enable_input_denoiser or args.input_denoiser_checkpoint is not None
-    )
     model = AdaptedCLIP(
         clip_model=clip_model,
         text_adapt_weight=args.text_adapt_weight,
@@ -202,22 +178,10 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
-        enable_input_denoiser=enable_input_denoiser,
-        input_denoiser_channels=args.input_denoiser_channels,
-        input_denoiser_width=args.input_denoiser_width,
-        input_denoiser_depth=args.input_denoiser_depth,
-        input_denoiser_max_residual=args.input_denoiser_max_residual,
+        patch_graph_feature_temperature=args.patch_graph_feature_temperature,
+        patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
     ).to(device)
     model.eval()
-    if args.input_denoiser_checkpoint is not None:
-        load_student_checkpoint(
-            model.image_adapter["input_denoiser"],
-            args.input_denoiser_checkpoint,
-            map_location=device,
-        )
-        logger.info(
-            "loaded input denoiser from %s", args.input_denoiser_checkpoint
-        )
     # load checkpoints if exists
     text_file = glob(args.save_path + "/text_adapter.pth")
     assert len(text_file) >= 0, "text adapter checkpoint not found"
@@ -283,6 +247,7 @@ def main():
                     device=device,
                     img_size=args.img_size,
                     dataset=args.dataset,
+                    noise_severity=args.noise_severity,
                 )
             # ========================================================
             if args.visualize:
