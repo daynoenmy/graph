@@ -1,3 +1,6 @@
+import os
+
+
 BASE_PATH = "/home/sunhan"
 DATA_PATH = {
     "Brain": f"{BASE_PATH}/dataset/Brain_AD",
@@ -11,6 +14,7 @@ DATA_PATH = {
     "MPDD": f"{BASE_PATH}/data/MPDD",
     "MVTec": f"{BASE_PATH}/data/mvtec_ad",
     "VisA": f"{BASE_PATH}/data/VisA_20220922",
+    "DDTI": os.environ.get("DDTI_DATA_PATH", f"{BASE_PATH}/data/DDTI"),
 }
 
 CLASS_NAMES = {
@@ -61,6 +65,7 @@ CLASS_NAMES = {
         "bracket_black",
     ],
     "BTAD": ["01", "02", "03"],
+    "DDTI": ["DDTI"],
 }
 DOMAINS = {
     "VisA": "Industrial",
@@ -74,11 +79,13 @@ DOMAINS = {
     "Colon_colonDB": "Medical",
     "Colon_Kvasir": "Medical",
     "Colon_cvc300": "Medical",
+    "DDTI": "Medical",
 }
 REAL_NAMES = {
     "Brain": {"Brain": "scan"},
     "Liver": {"Liver": "scan"},
     "Retina": {"Retina": "scan"},
+    "DDTI": {"DDTI": "thyroid ultrasound scan"},
     "MVTec": {
         "bottle": "dark bottle",
         "cable": "top view of three cables",

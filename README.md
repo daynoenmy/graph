@@ -47,6 +47,13 @@ python test.py --save_path $save_path --dataset $dataset
 bash scripts.sh
 ```
 
+### 4. Self-supervised diffusion input denoising
+
+The optional blind-spot + conditional-diffusion teacher and distilled input
+denoiser pipeline is documented in [DENOISING.md](DENOISING.md). The baseline
+behavior is unchanged unless `--enable_input_denoiser` or
+`--input_denoiser_checkpoint` is provided.
+
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.
 
 ## Additional Discussion

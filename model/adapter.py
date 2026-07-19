@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .adapter_modules import PatchGraphBlock, SimpleAdapter, SimpleProj
+from .denoising import CLIPInputDenoiser
 
 
 class AdaptedCLIP(nn.Module):
@@ -19,6 +20,11 @@ class AdaptedCLIP(nn.Module):
         patch_graph_alpha: float = 0.7,
         patch_graph_residual_weight: float = 0.2,
         patch_graph_use_spatial: bool = True,
+        enable_input_denoiser: bool = False,
+        input_denoiser_channels: int = 1,
+        input_denoiser_width: int = 32,
+        input_denoiser_depth: int = 5,
+        input_denoiser_max_residual: float = 0.2,
         **kwargs,
     ):
         super().__init__()
@@ -30,6 +36,7 @@ class AdaptedCLIP(nn.Module):
         self.i_w = image_adapt_weight
         self.levels = levels
         self.enable_patch_graph = enable_patch_graph
+        self.enable_input_denoiser = enable_input_denoiser
 
         layer_adapters = nn.ModuleList(
             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
@@ -49,8 +56,19 @@ class AdaptedCLIP(nn.Module):
             if enable_patch_graph
             else nn.Identity()
         )
+        input_denoiser = (
+            CLIPInputDenoiser(
+                image_channels=input_denoiser_channels,
+                width=input_denoiser_width,
+                depth=input_denoiser_depth,
+                max_residual=input_denoiser_max_residual,
+            )
+            if enable_input_denoiser
+            else nn.Identity()
+        )
         self.image_adapter = nn.ModuleDict(
             {
+                "input_denoiser": input_denoiser,
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
                 "det_proj": det_proj,
@@ -62,6 +80,11 @@ class AdaptedCLIP(nn.Module):
             + [SimpleProj(768, 768, relu=True)]
         )
         self._init_weights_()
+        if self.enable_input_denoiser:
+            # _init_weights_ initializes every adapter matrix. Restore the
+            # student's zero-output tail so a newly enabled denoiser starts as
+            # an identity mapping and does not disturb pretrained CLIP inputs.
+            self.image_adapter["input_denoiser"].reset_identity()
 
     def _init_weights_(self):
         for p in self.image_adapter.parameters():
@@ -73,6 +96,14 @@ class AdaptedCLIP(nn.Module):
 
     def image_trainable_parameters(self):
         yield from self.image_adapter.parameters()
+
+    def image_adapter_parameters_without_input_denoiser(self):
+        for name, module in self.image_adapter.items():
+            if name != "input_denoiser":
+                yield from module.parameters()
+
+    def input_denoiser_parameters(self):
+        yield from self.image_adapter["input_denoiser"].parameters()
 
     def text_trainable_parameters(self):
         yield from self.text_adapter.parameters()
@@ -90,6 +121,7 @@ class AdaptedCLIP(nn.Module):
             raise ValueError("modality must be visual")
 
     def forward(self, x):
+        x = self.image_adapter["input_denoiser"](x)
         x = self.image_encoder.conv1(x)
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)
