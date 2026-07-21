@@ -60,6 +60,12 @@ The former diffusion-denoising experiment is retained for reference in
 [DENOISING.md](DENOISING.md), but its checkpoints are not consumed by the
 current ``train.py`` or ``test.py`` pipeline.
 
+The medically grounded V2 experiment adds generic random-noise training,
+primary-only soft graph propagation, spectral control, and target-modality
+corruption evaluation while preserving V1 command defaults. Run
+``train_v2.bat`` and ``test_v2.bat``; implementation details and checkpoint
+compatibility are documented in [V2_ROBUSTNESS.md](V2_ROBUSTNESS.md).
+
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.
 
 ## Additional Discussion

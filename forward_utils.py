@@ -4,13 +4,11 @@ import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from tqdm import tqdm
 from kornia.filters import gaussian_blur2d
 from dataset.constants import CLASS_NAMES, REAL_NAMES, PROMPTS
 from model.tokenizer import tokenize
 from sklearn.metrics import roc_auc_score, average_precision_score
 from dataset.constants import DATA_PATH
-from utils import cos_sim
 
 # ================================================================================================
 # The following code is used to get criterion for training
@@ -246,10 +244,15 @@ def calculate_noise_consistency_loss(
     primary_features,
     reference_features,
     text_embeddings,
+    reduction="mean",
 ):
     """Symmetric prediction consistency across two intensity-noise views."""
     if reference_features is None:
+        if reduction == "none":
+            return primary_features[0].new_zeros(primary_features[0].shape[0])
         return primary_features[0].new_zeros(())
+    if reduction not in {"mean", "none"}:
+        raise ValueError("reduction must be 'mean' or 'none'")
     losses = []
     for primary, reference in zip(primary_features, reference_features):
         primary_log_prob = F.log_softmax(
@@ -266,8 +269,11 @@ def calculate_noise_consistency_loss(
         reference_to_primary = (
             reference_prob * (reference_log_prob - primary_log_prob)
         ).sum(dim=-1)
-        losses.append(0.5 * (primary_to_reference + reference_to_primary).mean())
-    return torch.stack(losses).mean()
+        losses.append(
+            0.5 * (primary_to_reference + reference_to_primary).mean(dim=-1)
+        )
+    per_sample_loss = torch.stack(losses, dim=0).mean(dim=0)
+    return per_sample_loss.mean() if reduction == "mean" else per_sample_loss
 
 
 def calculate_lesion_preservation_losses(

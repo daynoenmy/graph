@@ -9,6 +9,22 @@ from torchvision import transforms
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+GENERIC_MEDICAL_NOISE_TYPES = (
+    "additive",
+    "magnitude",
+    "signal_dependent",
+    "multiplicative",
+    "low_frequency",
+)
+NOISE_TYPE_ALIASES = {
+    "gaussian": "additive",
+    "rician": "magnitude",
+    "ct_quantum": "signal_dependent",
+    "quantum": "signal_dependent",
+    "speckle": "multiplicative",
+    "bias_field": "low_frequency",
+    "shot_noise": "shot",
+}
 
 
 def setup_seed(seed):
@@ -108,14 +124,31 @@ def noise_model_for_dataset(dataset_name):
     return "generic"
 
 
+def _smooth_random_field(raw):
+    field = torch.randn(
+        raw.shape[0], 1, 4, 4, device=raw.device, dtype=raw.dtype
+    )
+    field = F.interpolate(
+        field, size=raw.shape[-2:], mode="bilinear", align_corners=False
+    )
+    return field / field.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+
+
 @torch.no_grad()
-def make_medical_noise_view(image, dataset_name, severity=0.06):
+def make_medical_noise_view(
+    image,
+    dataset_name,
+    severity=0.06,
+    noise_type=None,
+):
     """Create a mask-aligned, modality-aware perturbation of a CLIP input.
 
     Args:
         image: CLIP-normalized RGB tensor with shape ``[B, 3, H, W]``.
         dataset_name: Name registered in ``dataset/constants.py``.
         severity: Perturbation magnitude in raw ``[0, 1]`` intensity space.
+        noise_type: Optional explicit corruption mechanism. When omitted, the
+            modality-specific family registered for ``dataset_name`` is used.
     """
     if image.ndim != 4 or image.shape[1] != 3:
         raise ValueError("image must have shape [B, 3, H, W]")
@@ -127,45 +160,177 @@ def make_medical_noise_view(image, dataset_name, severity=0.06):
     mean = image.new_tensor(CLIP_MEAN).view(1, 3, 1, 1)
     std = image.new_tensor(CLIP_STD).view(1, 3, 1, 1)
     raw = (image * std + mean).clamp(0.0, 1.0)
-    noise_model = noise_model_for_dataset(dataset_name)
+    noise_model = noise_type or noise_model_for_dataset(dataset_name)
+    noise_model = NOISE_TYPE_ALIASES.get(noise_model.lower(), noise_model.lower())
 
     if noise_model == "mri":
         # Magnitude-MR approximation: Rician corruption plus a smooth bias field.
         noise_real = torch.randn_like(raw) * severity
         noise_imag = torch.randn_like(raw) * severity
         perturbed = torch.sqrt((raw + noise_real).square() + noise_imag.square())
-        field = torch.randn(
-            raw.shape[0], 1, 4, 4, device=raw.device, dtype=raw.dtype
-        )
-        field = F.interpolate(
-            field, size=raw.shape[-2:], mode="bilinear", align_corners=False
-        )
-        field = field / field.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-        perturbed = perturbed * (1.0 + severity * field)
-    elif noise_model == "ultrasound":
+        perturbed = perturbed * (1.0 + severity * _smooth_random_field(raw))
+    elif noise_model in {"ultrasound", "multiplicative"}:
         # Multiplicative speckle with a small electronic-noise component.
         speckle = torch.randn_like(raw) * (severity * 1.5)
         perturbed = raw * (1.0 + speckle)
         perturbed = perturbed + torch.randn_like(raw) * (severity * 0.25)
-    elif noise_model == "ct":
+    elif noise_model in {"ct", "signal_dependent"}:
         # Signal-dependent Gaussian approximation of quantum noise.
         quantum_std = severity * torch.sqrt(raw.clamp_min(1.0 / 255.0))
         perturbed = raw + torch.randn_like(raw) * quantum_std
-    elif noise_model == "retina":
+    elif noise_model in {"retina", "shot"}:
         shot_std = severity * torch.sqrt(raw.clamp_min(1.0 / 255.0))
         perturbed = raw + torch.randn_like(raw) * shot_std
         perturbed = perturbed + torch.randn_like(raw) * (severity * 0.2)
-    elif noise_model == "endoscopy":
+    elif noise_model in {"endoscopy", "illumination"}:
         illumination = torch.empty(
             raw.shape[0], 1, 1, 1, device=raw.device, dtype=raw.dtype
         ).uniform_(1.0 - severity, 1.0 + severity)
         perturbed = raw * illumination
         perturbed = perturbed + torch.randn_like(raw) * (severity * 0.35)
-    else:
+    elif noise_model == "magnitude":
+        noise_real = torch.randn_like(raw) * severity
+        noise_imag = torch.randn_like(raw) * severity
+        perturbed = torch.sqrt((raw + noise_real).square() + noise_imag.square())
+    elif noise_model == "low_frequency":
+        perturbed = raw * (1.0 + severity * _smooth_random_field(raw))
+    elif noise_model in {"additive", "generic"}:
         perturbed = raw + torch.randn_like(raw) * severity
+    else:
+        valid_types = sorted(
+            set(GENERIC_MEDICAL_NOISE_TYPES)
+            | {
+                "mri",
+                "ct",
+                "ultrasound",
+                "retina",
+                "endoscopy",
+                "shot",
+                "illumination",
+            }
+            | set(NOISE_TYPE_ALIASES)
+        )
+        raise ValueError(
+            f"unknown noise type {noise_model!r}; available types: {valid_types}"
+        )
 
     perturbed = perturbed.clamp(0.0, 1.0)
     return (perturbed - mean) / std
+
+
+@torch.no_grad()
+def make_random_medical_noise_view(
+    image,
+    dataset_name,
+    noise_types=GENERIC_MEDICAL_NOISE_TYPES,
+    severity_min=0.0,
+    severity_max=0.06,
+    apply_probability=1.0,
+    noise_weights=None,
+):
+    """Apply independently sampled, mask-aligned noise to each batch item."""
+    if not 0.0 <= apply_probability <= 1.0:
+        raise ValueError("apply_probability must be in [0, 1]")
+    if severity_min < 0 or severity_max < severity_min:
+        raise ValueError("expected 0 <= severity_min <= severity_max")
+    noise_types = tuple(noise_types)
+    if not noise_types:
+        raise ValueError("noise_types must contain at least one noise mechanism")
+    if noise_weights is not None:
+        if len(noise_weights) != len(noise_types):
+            raise ValueError("noise_weights must match noise_types")
+        if any(weight < 0 for weight in noise_weights) or sum(noise_weights) <= 0:
+            raise ValueError("noise_weights must be non-negative with a positive sum")
+
+    views = []
+    sampled_types = []
+    sampled_severities = []
+    for sample in image.split(1, dim=0):
+        if random.random() >= apply_probability:
+            views.append(sample.detach().clone())
+            sampled_types.append("clean")
+            sampled_severities.append(0.0)
+            continue
+        sampled_type = random.choices(
+            noise_types,
+            weights=noise_weights,
+            k=1,
+        )[0]
+        sampled_severity = random.uniform(severity_min, severity_max)
+        views.append(
+            make_medical_noise_view(
+                sample,
+                dataset_name,
+                severity=sampled_severity,
+                noise_type=sampled_type,
+            )
+        )
+        sampled_types.append(sampled_type)
+        sampled_severities.append(sampled_severity)
+    return torch.cat(views, dim=0), sampled_types, sampled_severities
+
+
+@torch.no_grad()
+def preserve_lesion_contrast(
+    original,
+    perturbed,
+    mask,
+    min_retention=0.7,
+):
+    """Blend overly strong training noise back toward the source image.
+
+    Contrast is measured between the lesion and a local dilated background
+    ring. The mask is used only for source-domain training augmentation.
+    """
+    if not 0.0 <= min_retention <= 1.0:
+        raise ValueError("min_retention must be in [0, 1]")
+    if min_retention == 0 or mask is None:
+        return perturbed
+    if original.shape != perturbed.shape:
+        raise ValueError("original and perturbed images must have the same shape")
+    if mask.ndim != 4 or mask.shape[0] != original.shape[0]:
+        raise ValueError("mask must have shape [B, 1, H, W]")
+
+    mean = original.new_tensor(CLIP_MEAN).view(1, 3, 1, 1)
+    std = original.new_tensor(CLIP_STD).view(1, 3, 1, 1)
+
+    def grayscale(value):
+        raw = (value * std + mean).clamp(0.0, 1.0)
+        return raw.mean(dim=1, keepdim=True)
+
+    lesion = mask.float().clamp(0.0, 1.0)
+    dilated = F.max_pool2d(lesion, kernel_size=17, stride=1, padding=8)
+    background = (dilated - lesion).clamp(0.0, 1.0)
+    lesion_count = lesion.sum(dim=(-2, -1), keepdim=True)
+    background_count = background.sum(dim=(-2, -1), keepdim=True)
+    valid = (lesion_count > 0) & (background_count > 0)
+
+    def local_contrast(value):
+        gray = grayscale(value)
+        lesion_mean = (gray * lesion).sum(dim=(-2, -1), keepdim=True)
+        lesion_mean = lesion_mean / lesion_count.clamp_min(1.0)
+        background_mean = (gray * background).sum(dim=(-2, -1), keepdim=True)
+        background_mean = background_mean / background_count.clamp_min(1.0)
+        return (lesion_mean - background_mean).abs()
+
+    original_contrast = local_contrast(original)
+    perturbed_contrast = local_contrast(perturbed)
+    ratio = perturbed_contrast / original_contrast.clamp_min(1e-6)
+    needs_blend = valid & (original_contrast > 1e-4) & (ratio < min_retention)
+    max_alpha = (1.0 - min_retention) / (1.0 - ratio).clamp_min(1e-6)
+    alpha = torch.where(needs_blend, max_alpha.clamp(0.0, 1.0), torch.ones_like(ratio))
+    blended = original + alpha * (perturbed - original)
+
+    # A sign change in lesion/background contrast can violate the linear
+    # estimate above. Halving the perturbation provides a safe bounded fallback.
+    for _ in range(4):
+        blended_ratio = local_contrast(blended) / original_contrast.clamp_min(1e-6)
+        still_low = valid & (original_contrast > 1e-4) & (
+            blended_ratio < min_retention
+        )
+        alpha = torch.where(still_low, alpha * 0.5, alpha)
+        blended = original + alpha * (perturbed - original)
+    return blended
 
 
 def cos_sim(a_norm, b_norm):

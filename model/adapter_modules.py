@@ -77,6 +77,8 @@ class PatchGraphBlock(nn.Module):
         use_spatial=True,
         feature_temperature=0.2,
         anomaly_temperature=0.2,
+        soft_graph=False,
+        use_spectral_norm=False,
     ):
         super().__init__()
         self.k = k
@@ -85,7 +87,11 @@ class PatchGraphBlock(nn.Module):
         self.use_spatial = use_spatial
         self.feature_temperature = feature_temperature
         self.anomaly_temperature = anomaly_temperature
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.soft_graph = soft_graph
+        projection = nn.Linear(dim, dim, bias=False)
+        if use_spectral_norm:
+            projection = nn.utils.parametrizations.spectral_norm(projection)
+        self.proj = projection
         self.norm = nn.LayerNorm(dim)
         initial_gate = min(max(float(residual_weight), 1e-4), 1.0 - 1e-4)
         self.noise_gate_scale = nn.Parameter(torch.tensor(1.0))
@@ -108,7 +114,16 @@ class PatchGraphBlock(nn.Module):
 
     def forward(self, patch_features, uncertainty=None, anomaly_prob=None):
         batch_size, num_nodes, _ = patch_features.shape
-        semantic_adj = _build_knn_patch_graph(patch_features, k=self.k)
+        normalized_features = F.normalize(patch_features, dim=-1)
+        similarity = normalized_features @ normalized_features.transpose(1, 2)
+        feature_affinity = torch.exp(
+            (similarity - 1.0) / max(self.feature_temperature, 1e-4)
+        )
+        semantic_adj = (
+            feature_affinity
+            if self.soft_graph
+            else _build_knn_patch_graph(patch_features, k=self.k)
+        )
         if self.use_spatial:
             grid_size = int(num_nodes ** 0.5)
             if grid_size * grid_size == num_nodes:
@@ -127,7 +142,18 @@ class PatchGraphBlock(nn.Module):
         # Preserve the original fixed graph behavior for baseline ablations and
         # checkpoints that do not provide a second noise view or text anchors.
         if uncertainty is None and anomaly_prob is None:
-            normalized_adj = _normalize_adj(adj)
+            if self.soft_graph:
+                eye = torch.eye(
+                    num_nodes,
+                    device=patch_features.device,
+                    dtype=patch_features.dtype,
+                ).unsqueeze(0)
+                normalized_adj = adj + eye
+                normalized_adj = normalized_adj / normalized_adj.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-6)
+            else:
+                normalized_adj = _normalize_adj(adj)
             graph_features = normalized_adj @ patch_features
             graph_features = self.norm(self.proj(graph_features))
             out = (
@@ -143,11 +169,6 @@ class PatchGraphBlock(nn.Module):
             anomaly_prob, patch_features, "anomaly_prob"
         ).detach().clamp(0.0, 1.0)
 
-        normalized_features = F.normalize(patch_features, dim=-1)
-        similarity = normalized_features @ normalized_features.transpose(1, 2)
-        feature_affinity = torch.exp(
-            (similarity - 1.0) / max(self.feature_temperature, 1e-4)
-        )
         anomaly_difference = (
             anomaly_prob.unsqueeze(-1) - anomaly_prob.unsqueeze(1)
         ).abs()
@@ -158,7 +179,12 @@ class PatchGraphBlock(nn.Module):
         # A noisy source node should contribute less, while a noisy receiver
         # may still request more information through its adaptive update gate.
         source_reliability = (1.0 - uncertainty).unsqueeze(1).clamp_min(0.05)
-        weighted_adj = adj * feature_affinity * boundary_affinity * source_reliability
+        if self.soft_graph:
+            weighted_adj = adj * boundary_affinity * source_reliability
+        else:
+            weighted_adj = (
+                adj * feature_affinity * boundary_affinity * source_reliability
+            )
         eye = torch.eye(
             num_nodes, device=patch_features.device, dtype=patch_features.dtype
         ).unsqueeze(0)

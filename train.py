@@ -1,5 +1,6 @@
 import os
 import argparse
+from collections import Counter
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -10,7 +11,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 
-from utils import make_medical_noise_view, setup_seed
+from utils import (
+    GENERIC_MEDICAL_NOISE_TYPES,
+    make_medical_noise_view,
+    make_random_medical_noise_view,
+    preserve_lesion_contrast,
+    setup_seed,
+)
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
 from dataset import get_dataset
@@ -35,6 +42,16 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = str(cpu_num)
 os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_num)
 torch.set_num_threads(cpu_num)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def curriculum_severity_max(epoch, total_epochs, final_max):
+    """Three-stage medical noise curriculum ending at ``final_max``."""
+    progress = (epoch + 1) / max(total_epochs, 1)
+    if progress <= 0.25:
+        return final_max * 0.3
+    if progress <= 0.60:
+        return final_max * 0.6
+    return final_max
 
 
 def train_text_adapter(
@@ -130,17 +147,39 @@ def train_image_adapter(
     dataset_name: str,
     noise_severity: float,
     noise_consistency_weight: float,
+    noise_balance_weight: float,
     lesion_preservation_weight: float,
     boundary_contrast_weight: float,
     boundary_margin: float,
+    train_noise_types,
+    train_noise_weights,
+    primary_noise_probability: float,
+    noise_severity_min: float,
+    noise_severity_max: float,
+    num_noise_views: int,
+    min_lesion_contrast_retention: float,
+    run_config,
     logger: logging.Logger,
 ):
+    # Keep the frozen CLIP encoder in evaluation mode while allowing spectral
+    # normalization in the V2 graph projection to update its power iteration.
+    model.image_adapter.train()
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
         consistency_loss_list = []
+        balance_loss_list = []
         preservation_loss_list = []
         boundary_loss_list = []
+        primary_noise_counts = Counter()
+        reference_noise_counts = Counter()
+        sampled_severities = []
+        v2_noise_training = train_noise_types is not None
+        current_severity_max = curriculum_severity_max(
+            epoch,
+            image_epoch,
+            noise_severity_max,
+        )
         for input_data in tqdm(train_loader):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
@@ -151,15 +190,61 @@ def train_image_adapter(
                 [text_embeddings[class_name] for class_name in class_names], dim=0
             )
 
-            # The second, mask-aligned intensity view estimates patch noise
-            # sensitivity. It is not a reconstructed or pseudo-clean image.
-            reference_image = make_medical_noise_view(
-                image, dataset_name, severity=noise_severity
-            )
+            if v2_noise_training:
+                primary_image, primary_types, primary_severities = (
+                    make_random_medical_noise_view(
+                        image,
+                        dataset_name,
+                        noise_types=train_noise_types,
+                        severity_min=noise_severity_min,
+                        severity_max=current_severity_max,
+                        apply_probability=primary_noise_probability,
+                        noise_weights=train_noise_weights,
+                    )
+                )
+                primary_image = preserve_lesion_contrast(
+                    image,
+                    primary_image,
+                    mask,
+                    min_retention=min_lesion_contrast_retention,
+                )
+                reference_images = []
+                for _ in range(num_noise_views):
+                    reference_image, reference_types, reference_severities = (
+                        make_random_medical_noise_view(
+                            primary_image,
+                            dataset_name,
+                            noise_types=train_noise_types,
+                            severity_min=noise_severity_min,
+                            severity_max=current_severity_max,
+                            apply_probability=1.0,
+                            noise_weights=train_noise_weights,
+                        )
+                    )
+                    reference_image = preserve_lesion_contrast(
+                        primary_image,
+                        reference_image,
+                        mask,
+                        min_retention=min_lesion_contrast_retention,
+                    )
+                    reference_images.append(reference_image)
+                    reference_noise_counts.update(reference_types)
+                    sampled_severities.extend(reference_severities)
+                primary_noise_counts.update(primary_types)
+                sampled_severities.extend(primary_severities)
+                model_input = primary_image
+                reference_input = reference_images
+            else:
+                # V1 compatibility: a clean primary input and one
+                # modality-specific auxiliary view.
+                model_input = image
+                reference_input = make_medical_noise_view(
+                    image, dataset_name, severity=noise_severity
+                )
             optimizer.zero_grad(set_to_none=True)
             patch_features, det_feature, auxiliary = model(
-                image,
-                reference_image=reference_image,
+                model_input,
+                reference_image=reference_input,
                 text_embeddings=epoch_text_feature,
                 return_aux=True,
             )
@@ -172,11 +257,28 @@ def train_image_adapter(
                 # text-image alignment
                 patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
                 loss += calculate_seg_loss(patch_preds, mask)  # backward
-            consistency_loss = calculate_noise_consistency_loss(
-                auxiliary["primary_features"],
-                auxiliary["reference_features"],
-                epoch_text_feature,
-            )
+            if v2_noise_training:
+                view_consistency_losses = torch.stack(
+                    [
+                        calculate_noise_consistency_loss(
+                            auxiliary["primary_features"],
+                            reference_features,
+                            epoch_text_feature,
+                        )
+                        for reference_features in auxiliary[
+                            "reference_feature_views"
+                        ]
+                    ]
+                )
+                consistency_loss = view_consistency_losses.mean()
+                balance_loss = view_consistency_losses.var(unbiased=False)
+            else:
+                consistency_loss = calculate_noise_consistency_loss(
+                    auxiliary["primary_features"],
+                    auxiliary["reference_features"],
+                    epoch_text_feature,
+                )
+                balance_loss = consistency_loss.new_zeros(())
             preservation_loss, boundary_loss = calculate_lesion_preservation_losses(
                 patch_features,
                 auxiliary["primary_features"],
@@ -184,27 +286,41 @@ def train_image_adapter(
                 boundary_margin=boundary_margin,
             )
             loss = loss + noise_consistency_weight * consistency_loss
+            loss = loss + noise_balance_weight * balance_loss
             loss = loss + lesion_preservation_weight * preservation_loss
             loss = loss + boundary_contrast_weight * boundary_loss
             loss.backward()
             optimizer.step()
             loss_list.append(loss.item())
             consistency_loss_list.append(consistency_loss.item())
+            balance_loss_list.append(balance_loss.item())
             preservation_loss_list.append(preservation_loss.item())
             boundary_loss_list.append(boundary_loss.item())
             scheduler.step()
         logger.info(f"loss: {np.mean(loss_list)}")
         logger.info(
-            "noise consistency: %.6f, lesion preservation: %.6f, boundary: %.6f",
+            "noise consistency: %.6f, noise balance: %.6f, "
+            "lesion preservation: %.6f, boundary: %.6f",
             np.mean(consistency_loss_list),
+            np.mean(balance_loss_list),
             np.mean(preservation_loss_list),
             np.mean(boundary_loss_list),
         )
+        if v2_noise_training:
+            logger.info(
+                "V2 noise curriculum max: %.4f, sampled severity mean: %.4f, "
+                "primary types: %s, reference types: %s",
+                current_severity_max,
+                np.mean(sampled_severities),
+                dict(primary_noise_counts),
+                dict(reference_noise_counts),
+            )
         # save checkpoint
         model_dict = {
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
+            "config": run_config,
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -213,6 +329,7 @@ def train_image_adapter(
                 model_dict,
                 ckp_path,
             )
+    model.eval()
     return model
 
 
@@ -262,13 +379,56 @@ def main():
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
     parser.add_argument("--patch_graph_feature_temperature", type=float, default=0.2)
     parser.add_argument("--patch_graph_anomaly_temperature", type=float, default=0.2)
+    parser.add_argument("--patch_graph_soft", action="store_true")
+    parser.add_argument("--patch_graph_spectral_norm", action="store_true")
+    parser.add_argument(
+        "--graph_primary_only",
+        action="store_true",
+        help="use auxiliary views only to estimate uncertainty",
+    )
     parser.add_argument("--noise_severity", type=float, default=0.06)
+    parser.add_argument(
+        "--train_noise_types",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "enable V2 training with generic noise mechanisms; recommended: "
+            + " ".join(GENERIC_MEDICAL_NOISE_TYPES)
+        ),
+    )
+    parser.add_argument("--train_noise_weights", type=float, nargs="+", default=None)
+    parser.add_argument("--primary_noise_probability", type=float, default=0.0)
+    parser.add_argument("--noise_severity_min", type=float, default=0.0)
+    parser.add_argument("--noise_severity_max", type=float, default=0.10)
+    parser.add_argument("--num_noise_views", type=int, default=1)
+    parser.add_argument("--noise_balance_weight", type=float, default=0.05)
+    parser.add_argument(
+        "--min_lesion_contrast_retention",
+        type=float,
+        default=0.7,
+    )
     parser.add_argument("--noise_consistency_weight", type=float, default=0.1)
     parser.add_argument("--lesion_preservation_weight", type=float, default=0.1)
     parser.add_argument("--boundary_contrast_weight", type=float, default=0.05)
     parser.add_argument("--boundary_margin", type=float, default=0.2)
 
     args = parser.parse_args()
+    if not 0.0 <= args.primary_noise_probability <= 1.0:
+        parser.error("primary_noise_probability must be in [0, 1]")
+    if args.noise_severity_min < 0 or args.noise_severity_max < args.noise_severity_min:
+        parser.error("expected 0 <= noise_severity_min <= noise_severity_max")
+    if args.num_noise_views < 1:
+        parser.error("num_noise_views must be at least 1")
+    if not 0.0 <= args.min_lesion_contrast_retention <= 1.0:
+        parser.error("min_lesion_contrast_retention must be in [0, 1]")
+    if args.train_noise_weights is not None:
+        if args.train_noise_types is None:
+            parser.error("train_noise_weights requires train_noise_types")
+        if len(args.train_noise_weights) != len(args.train_noise_types):
+            parser.error("train_noise_weights must match train_noise_types")
+    if args.primary_noise_probability > 0 and args.train_noise_types is None:
+        parser.error("primary noise training requires train_noise_types")
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -318,6 +478,9 @@ def main():
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
         patch_graph_feature_temperature=args.patch_graph_feature_temperature,
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
+        patch_graph_soft=args.patch_graph_soft,
+        patch_graph_spectral_norm=args.patch_graph_spectral_norm,
+        graph_primary_only=args.graph_primary_only,
     ).to(device)
     model.eval()
     for parameter in model.clipmodel.parameters():
@@ -339,7 +502,7 @@ def main():
     # load checkpoints if exists
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
-        checkpoint = torch.load(text_file[0])
+        checkpoint = torch.load(text_file[0], map_location=device)
         model.text_adapter.load_state_dict(checkpoint["text_adapter"])
         try:
             text_optimizer.load_state_dict(checkpoint["text_optimizer"])
@@ -354,9 +517,32 @@ def main():
         adapt_text = True  # check if text adapter is loaded
     file = glob(args.save_path + "/image_adapter.pth")
     if len(file) > 0:
-        checkpoint = torch.load(file[0])
+        checkpoint = torch.load(file[0], map_location=device)
+        checkpoint_config = checkpoint.get("config", {})
+        for config_name in (
+            "patch_graph_soft",
+            "patch_graph_spectral_norm",
+            "graph_primary_only",
+        ):
+            if config_name in checkpoint_config and bool(
+                checkpoint_config[config_name]
+            ) != bool(getattr(args, config_name)):
+                raise ValueError(
+                    f"existing checkpoint architecture does not match "
+                    f"--{config_name}; use a separate save_path"
+                )
         image_start_epoch = checkpoint["epoch"]
-        model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
+        load_result = model.image_adapter.load_state_dict(
+            checkpoint["image_adapter"], strict=False
+        )
+        if checkpoint_config and (
+            load_result.missing_keys or load_result.unexpected_keys
+        ):
+            raise RuntimeError(
+                "checkpoint/model architecture mismatch; missing keys: "
+                f"{load_result.missing_keys}, unexpected keys: "
+                f"{load_result.unexpected_keys}"
+            )
         try:
             image_optimizer.load_state_dict(checkpoint["image_optimizer"])
         except ValueError:
@@ -425,9 +611,18 @@ def main():
         dataset_name=args.dataset,
         noise_severity=args.noise_severity,
         noise_consistency_weight=args.noise_consistency_weight,
+        noise_balance_weight=args.noise_balance_weight,
         lesion_preservation_weight=args.lesion_preservation_weight,
         boundary_contrast_weight=args.boundary_contrast_weight,
         boundary_margin=args.boundary_margin,
+        train_noise_types=args.train_noise_types,
+        train_noise_weights=args.train_noise_weights,
+        primary_noise_probability=args.primary_noise_probability,
+        noise_severity_min=args.noise_severity_min,
+        noise_severity_max=args.noise_severity_max,
+        num_noise_views=args.num_noise_views,
+        min_lesion_contrast_retention=args.min_lesion_contrast_retention,
+        run_config=vars(args).copy(),
         logger=logger,
     )
 

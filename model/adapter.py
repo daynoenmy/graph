@@ -21,6 +21,9 @@ class AdaptedCLIP(nn.Module):
         patch_graph_use_spatial: bool = True,
         patch_graph_feature_temperature: float = 0.2,
         patch_graph_anomaly_temperature: float = 0.2,
+        patch_graph_soft: bool = False,
+        patch_graph_spectral_norm: bool = False,
+        graph_primary_only: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -32,6 +35,7 @@ class AdaptedCLIP(nn.Module):
         self.i_w = image_adapt_weight
         self.levels = levels
         self.enable_patch_graph = enable_patch_graph
+        self.graph_primary_only = graph_primary_only
 
         layer_adapters = nn.ModuleList(
             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
@@ -49,6 +53,8 @@ class AdaptedCLIP(nn.Module):
                 use_spatial=patch_graph_use_spatial,
                 feature_temperature=patch_graph_feature_temperature,
                 anomaly_temperature=patch_graph_anomaly_temperature,
+                soft_graph=patch_graph_soft,
+                use_spectral_norm=patch_graph_spectral_norm,
             )
             if enable_patch_graph
             else nn.Identity()
@@ -197,18 +203,59 @@ class AdaptedCLIP(nn.Module):
             # The perturbed branch is a stable teacher view. Gradients flow
             # through the primary branch and graph parameters only, reducing
             # memory while still enforcing noise consistency.
+            reference_images = (
+                list(reference_image)
+                if isinstance(reference_image, (list, tuple))
+                else [reference_image]
+            )
+            if not reference_images:
+                raise ValueError("reference_image must contain at least one view")
+            reference_seg_views = []
+            reference_det_views = []
             with torch.no_grad():
-                reference_seg, reference_det = self._encode_pre_graph(reference_image)
-            graph_seg = [
-                (primary + reference) * 0.5
-                for primary, reference in zip(primary_seg, reference_seg)
+                for view in reference_images:
+                    view_seg, view_det = self._encode_pre_graph(view)
+                    reference_seg_views.append(view_seg)
+                    reference_det_views.append(view_det)
+            reference_seg = [
+                torch.stack(
+                    [view[level] for view in reference_seg_views], dim=0
+                ).mean(dim=0)
+                for level in range(len(primary_seg))
             ]
-            graph_det = (primary_det + reference_det) * 0.5
+            reference_det = torch.stack(reference_det_views, dim=0).mean(dim=0)
+            if self.graph_primary_only:
+                # V2: use the perturbed view only as an uncertainty probe so
+                # its additional noise is never fused into the prediction.
+                graph_seg = primary_seg
+                graph_det = primary_det
+            else:
+                # V1 compatibility: retain the original two-view ensemble.
+                graph_seg = [
+                    (primary + reference) * 0.5
+                    for primary, reference in zip(primary_seg, reference_seg)
+                ]
+                graph_det = (primary_det + reference_det) * 0.5
+            uncertainty_views = [
+                [
+                    self._patch_uncertainty(primary, reference)
+                    for primary, reference in zip(primary_seg, view)
+                ]
+                for view in reference_seg_views
+            ]
             seg_uncertainty = [
-                self._patch_uncertainty(primary, reference)
-                for primary, reference in zip(primary_seg, reference_seg)
+                torch.stack(
+                    [view[level] for view in uncertainty_views], dim=0
+                ).mean(dim=0)
+                for level in range(len(primary_seg))
             ]
-            det_uncertainty = self._patch_uncertainty(primary_det, reference_det)
+            det_uncertainty = torch.stack(
+                [
+                    self._patch_uncertainty(primary_det, view)
+                    for view in reference_det_views
+                ],
+                dim=0,
+            ).mean(dim=0)
 
         seg_anomaly_prob = [
             self._anomaly_probability(features, text_embeddings)
@@ -231,8 +278,14 @@ class AdaptedCLIP(nn.Module):
         auxiliary = {
             "primary_features": primary_seg,
             "reference_features": reference_seg,
+            "reference_feature_views": (
+                reference_seg_views if reference_image is not None else None
+            ),
             "graph_input_features": graph_seg,
             "uncertainty": seg_uncertainty,
+            "uncertainty_views": (
+                uncertainty_views if reference_image is not None else None
+            ),
             "anomaly_probability": seg_anomaly_prob,
         }
         return refined_seg, det_token, auxiliary
