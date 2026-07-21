@@ -44,16 +44,6 @@ torch.set_num_threads(cpu_num)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def curriculum_severity_max(epoch, total_epochs, final_max):
-    """Three-stage medical noise curriculum ending at ``final_max``."""
-    progress = (epoch + 1) / max(total_epochs, 1)
-    if progress <= 0.25:
-        return final_max * 0.3
-    if progress <= 0.60:
-        return final_max * 0.6
-    return final_max
-
-
 def train_text_adapter(
     adapted_model: nn.Module,
     clip_surgery: nn.Module,
@@ -175,11 +165,6 @@ def train_image_adapter(
         reference_noise_counts = Counter()
         sampled_severities = []
         v2_noise_training = train_noise_types is not None
-        current_severity_max = curriculum_severity_max(
-            epoch,
-            image_epoch,
-            noise_severity_max,
-        )
         for input_data in tqdm(train_loader):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
@@ -197,7 +182,7 @@ def train_image_adapter(
                         dataset_name,
                         noise_types=train_noise_types,
                         severity_min=noise_severity_min,
-                        severity_max=current_severity_max,
+                        severity_max=noise_severity_max,
                         apply_probability=primary_noise_probability,
                         noise_weights=train_noise_weights,
                     )
@@ -212,17 +197,17 @@ def train_image_adapter(
                 for _ in range(num_noise_views):
                     reference_image, reference_types, reference_severities = (
                         make_random_medical_noise_view(
-                            primary_image,
+                            image,
                             dataset_name,
                             noise_types=train_noise_types,
                             severity_min=noise_severity_min,
-                            severity_max=current_severity_max,
+                            severity_max=noise_severity_max,
                             apply_probability=1.0,
                             noise_weights=train_noise_weights,
                         )
                     )
                     reference_image = preserve_lesion_contrast(
-                        primary_image,
+                        image,
                         reference_image,
                         mask,
                         min_retention=min_lesion_contrast_retention,
@@ -308,9 +293,11 @@ def train_image_adapter(
         )
         if v2_noise_training:
             logger.info(
-                "V2 noise curriculum max: %.4f, sampled severity mean: %.4f, "
+                "V2 fixed severity range: [%.4f, %.4f], "
+                "sampled severity mean: %.4f, "
                 "primary types: %s, reference types: %s",
-                current_severity_max,
+                noise_severity_min,
+                noise_severity_max,
                 np.mean(sampled_severities),
                 dict(primary_noise_counts),
                 dict(reference_noise_counts),

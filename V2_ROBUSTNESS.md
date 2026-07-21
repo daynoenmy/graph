@@ -17,14 +17,18 @@ perturbation mechanisms:
 - `low_frequency`
 
 These names describe mathematical corruption mechanisms rather than claiming
-that every acquisition modality physically contains every noise family. By
-default, 70% of primary inputs are perturbed and 30% stay clean. Two additional
-independent perturbations are used as uncertainty probes.
+that every acquisition modality physically contains every noise family. The
+V2 fine-tuning command keeps 70% of primary inputs clean and perturbs 30%.
+Two additional independent perturbations are generated directly from the
+original image and used as uncertainty probes; noise is not stacked on an
+already perturbed primary input.
 
-The maximum severity follows a three-stage curriculum. With a final maximum of
-`0.10`, the stages use maxima of `0.03`, `0.06`, and `0.10` for the first 25%,
-next 35%, and final 40% of image-adapter epochs. Noise types are sampled
-uniformly unless `--train_noise_weights` is supplied.
+V2 uses the same fixed severity distribution throughout fine-tuning instead of
+a three-stage curriculum. `train_v2.bat` samples severity uniformly from
+`0.00` to `0.06` in every epoch. Noise types are sampled uniformly unless
+`--train_noise_weights` is supplied. This keeps the robustness objective a
+small regularizer around the pretrained representation rather than making
+late, strong synthetic corruption the dominant task.
 
 Source masks never alter spatial augmentation. They are used only to reduce an
 overly strong intensity perturbation when it would retain less than the
@@ -50,7 +54,9 @@ update gate. Spectral normalization constrains the graph projection operator.
 V2 keeps the original classification, segmentation, lesion-preservation, and
 boundary losses. It averages consistency across independent probe views and
 penalizes variance between those view losses, avoiding a hard worst-noise
-objective.
+objective. The V2 command trains the image adapter for five epochs, saves every
+epoch, and uses smaller auxiliary-loss weights than V1. A held-out validation
+set should select the checkpoint; the final epoch is not assumed to be best.
 
 ## Commands
 
@@ -60,11 +66,16 @@ Train Brain V2:
 train_v2.bat
 ```
 
-Test all V2 image checkpoints on noisy Liver inputs:
+Test all V2 image checkpoints on both clean and noisy Liver inputs:
 
 ```bat
 test_v2.bat
 ```
+
+The two evaluations use the same checkpoints and produce separate summary
+files for severity `0.0` and `0.06`. This exposes both clean accuracy and the
+corruption-induced drop instead of judging robustness from noisy accuracy
+alone.
 
 The target dataset selects the default medically corresponding corruption:
 
@@ -86,11 +97,15 @@ separate directories:
 ```text
 ckpt/noise_graph
 ckpt/noise_graph_v2
+ckpt/noise_graph_v2_finetune
 ```
 
 V2 image checkpoints record their architecture configuration. Evaluation stops
 with an explicit error when soft-graph, spectral-normalization, or primary-only
 flags do not match the checkpoint instead of silently evaluating the wrong
 model.
+
+The lightweight fine-tuning revision uses `ckpt/noise_graph_v2_finetune` so
+an earlier three-stage V2 checkpoint cannot be resumed accidentally.
 
 The dataset loader and `full-shot.jsonl` selection mechanism are unchanged.
