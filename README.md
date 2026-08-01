@@ -56,9 +56,61 @@ It does not reconstruct images and requires neither a diffusion model nor a
 distilled denoiser. See ``train.bat`` for Brain source training and ``test.bat``
 for a Brain-to-Liver cross-dataset example.
 
+The image branch also retains CLIP's final CLS output as a global semantic
+anchor. By default, the image representation uses a 0.2 CLS residual, and the
+medical image score combines 0.8 pixel-map maximum with 0.2 global score:
+
+```bash
+python train.py --dataset Brain --training_mode full_shot \
+  --save_path ./ckpt/noise_graph_cls --clip_global_weight 0.2
+
+python test.py --dataset Liver --save_path ./ckpt/noise_graph_cls \
+  --clip_global_weight 0.2 --medical_image_score_global_weight 0.2
+```
+
+Set both new weights to zero for the pre-CLS V1 ablation. The batch files use a
+separate ``noise_graph_cls`` directory so the original V1 checkpoints are not
+overwritten.
+
 The former diffusion-denoising experiment is retained for reference in
 [DENOISING.md](DENOISING.md), but its checkpoints are not consumed by the
 current ``train.py`` or ``test.py`` pipeline.
+
+For a paired medical case study against the original AA-CLIP, run:
+
+```bash
+python case_analysis.py \
+  --dataset Liver \
+  --aa_save_path ./ckpt/baseline \
+  --aa_image_checkpoint image_adapter_1.pth \
+  --v1_save_path ./ckpt/noise_graph_cls \
+  --v1_image_checkpoint image_adapter_1.pth \
+  --output_dir ./case_results/Liver
+```
+
+The script exports per-image statistics, representative median cases, selected
+case metrics, and AA-CLIP/V1/uncertainty comparison panels. Select both
+checkpoints without using the target test set.
+
+To explain how V1 treats four representative patch states in one real case,
+run:
+
+```bash
+python visualize_patch_states.py \
+  --dataset Liver \
+  --save_path ./ckpt/noise_graph_cls \
+  --image_checkpoint image_adapter_1.pth \
+  --label anomaly \
+  --case_index 0 \
+  --noise_severity 0.06 \
+  --output_dir ./patch_state_examples/Liver
+```
+
+The script visualizes uncertainty, anomaly probability, clean/noisy prediction
+disagreement, source reliability, the learned graph gate, four post-hoc patch
+states, and exact graph source weights. The four colors are explanatory
+thresholds only; V1 itself uses continuous scores rather than a four-class
+head.
 
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.
 

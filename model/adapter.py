@@ -21,9 +21,12 @@ class AdaptedCLIP(nn.Module):
         patch_graph_use_spatial: bool = True,
         patch_graph_feature_temperature: float = 0.2,
         patch_graph_anomaly_temperature: float = 0.2,
+        clip_global_weight: float = 0.0,
         **kwargs,
     ):
         super().__init__()
+        if not 0.0 <= clip_global_weight <= 1.0:
+            raise ValueError("clip_global_weight must be in [0, 1]")
         self.clipmodel = clip_model
         self.image_encoder = clip_model.visual
         self.text_adapt_until = text_adapt_until
@@ -32,6 +35,7 @@ class AdaptedCLIP(nn.Module):
         self.i_w = image_adapt_weight
         self.levels = levels
         self.enable_patch_graph = enable_patch_graph
+        self.clip_global_weight = float(clip_global_weight)
 
         layer_adapters = nn.ModuleList(
             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
@@ -135,13 +139,17 @@ class AdaptedCLIP(nn.Module):
                 tokens.append(x[1:, :, :])
 
         x = x.permute(1, 0, 2)
+        global_token, _ = self.image_encoder._global_pool(x)
+        global_token = self.image_encoder.ln_post(global_token)
+        if self.image_encoder.proj is not None:
+            global_token = global_token @ self.image_encoder.proj
         tokens = [t.permute(1, 0, 2) for t in tokens]
         tokens = [self.image_encoder.ln_post(t) for t in tokens]
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
         det_token = self.image_adapter["det_proj"](tokens[-1])
-        return seg_tokens, det_token
+        return seg_tokens, det_token, global_token
 
     @staticmethod
     def _patch_uncertainty(primary_features, reference_features):
@@ -185,10 +193,11 @@ class AdaptedCLIP(nn.Module):
         text_embeddings=None,
         return_aux=False,
     ):
-        primary_seg, primary_det = self._encode_pre_graph(x)
+        primary_seg, primary_det, primary_global = self._encode_pre_graph(x)
 
         if reference_image is None:
             reference_seg = None
+            reference_global = None
             graph_seg = primary_seg
             graph_det = primary_det
             seg_uncertainty = [None for _ in primary_seg]
@@ -198,7 +207,9 @@ class AdaptedCLIP(nn.Module):
             # through the primary branch and graph parameters only, reducing
             # memory while still enforcing noise consistency.
             with torch.no_grad():
-                reference_seg, reference_det = self._encode_pre_graph(reference_image)
+                reference_seg, reference_det, reference_global = self._encode_pre_graph(
+                    reference_image
+                )
             graph_seg = [
                 (primary + reference) * 0.5
                 for primary, reference in zip(primary_seg, reference_seg)
@@ -224,13 +235,26 @@ class AdaptedCLIP(nn.Module):
         refined_det = self._refine_patch_features(
             graph_det, det_uncertainty, det_anomaly_prob
         )
-        det_token = F.normalize(refined_det, dim=-1).mean(1)
+        graph_det_token = F.normalize(refined_det, dim=-1).mean(1)
+        if self.clip_global_weight > 0.0:
+            det_token = F.normalize(
+                (1.0 - self.clip_global_weight) * F.normalize(graph_det_token, dim=-1)
+                + self.clip_global_weight * F.normalize(primary_global, dim=-1),
+                dim=-1,
+            )
+        else:
+            # Preserve the exact pre-CLS behavior for baseline ablations and
+            # existing callers that do not opt into the global semantic anchor.
+            det_token = graph_det_token
 
         if not return_aux:
             return refined_seg, det_token
         auxiliary = {
             "primary_features": primary_seg,
             "reference_features": reference_seg,
+            "primary_global_feature": primary_global,
+            "reference_global_feature": reference_global,
+            "graph_detection_feature": graph_det_token,
             "graph_input_features": graph_seg,
             "uncertainty": seg_uncertainty,
             "anomaly_probability": seg_anomaly_prob,

@@ -7,11 +7,10 @@ from glob import glob
 from pandas import DataFrame, Series
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 
-from utils import make_medical_noise_view, setup_seed, cos_sim
+from utils import make_medical_noise_view, setup_seed
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
 from dataset import get_dataset, DOMAINS
@@ -131,16 +130,40 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
-    parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
+    parser.add_argument(
+        "--disable_patch_graph",
+        action="store_true",
+        help="disable patch-level graph refinement",
+    )
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
     parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
-    parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
+    parser.add_argument(
+        "--disable_patch_graph_spatial",
+        action="store_true",
+        help="disable spatial edges in patch graph",
+    )
     parser.add_argument("--patch_graph_feature_temperature", type=float, default=0.2)
     parser.add_argument("--patch_graph_anomaly_temperature", type=float, default=0.2)
     parser.add_argument("--noise_severity", type=float, default=0.06)
+    parser.add_argument(
+        "--clip_global_weight",
+        type=float,
+        default=0.2,
+        help="weight of the final CLIP CLS feature in image-level fusion",
+    )
+    parser.add_argument(
+        "--medical_image_score_global_weight",
+        type=float,
+        default=0.2,
+        help="weight of the fused global score in medical Image AUC/AP",
+    )
 
     args = parser.parse_args()
+    if not 0.0 <= args.clip_global_weight <= 1.0:
+        parser.error("clip_global_weight must be in [0, 1]")
+    if not 0.0 <= args.medical_image_score_global_weight <= 1.0:
+        parser.error("medical_image_score_global_weight must be in [0, 1]")
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -180,6 +203,7 @@ def main():
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
         patch_graph_feature_temperature=args.patch_graph_feature_temperature,
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
+        clip_global_weight=args.clip_global_weight,
     ).to(device)
     model.eval()
     # load checkpoints if exists
@@ -196,6 +220,16 @@ def main():
     assert len(files) > 0, "image adapter checkpoint not found"
     for file in files:
         checkpoint = torch.load(file)
+        checkpoint_global_weight = checkpoint.get("clip_global_weight")
+        if (
+            checkpoint_global_weight is not None
+            and abs(float(checkpoint_global_weight) - args.clip_global_weight) > 1e-8
+        ):
+            raise ValueError(
+                "clip_global_weight does not match checkpoint: "
+                f"checkpoint={checkpoint_global_weight}, "
+                f"argument={args.clip_global_weight}"
+            )
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         test_epoch = checkpoint["epoch"]
         logger.info("-----------------------------------------------")
@@ -266,6 +300,7 @@ def main():
                 preds_image,
                 class_name,
                 domain=DOMAINS[args.dataset],
+                medical_global_weight=args.medical_image_score_global_weight,
             )
             df.loc[len(df)] = Series(class_result_dict)
         average_result = df.mean(numeric_only=True)

@@ -205,6 +205,7 @@ def train_image_adapter(
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
+            "clip_global_weight": model.clip_global_weight,
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -236,13 +237,19 @@ def main():
         default="few_shot",
         choices=["few_shot", "full_shot"],
     )
-    parser.add_argument("--shot", type=int, default=32, help="number of shots (0 means full shot)")
+    parser.add_argument(
+        "--shot", type=int, default=32, help="number of shots (0 means full shot)"
+    )
     parser.add_argument("--text_batch_size", type=int, default=16)
     parser.add_argument("--image_batch_size", type=int, default=2)
     parser.add_argument("--text_epoch", type=int, default=5, help="epochs for stage1")
     parser.add_argument("--image_epoch", type=int, default=20, help="epochs for stage2")
-    parser.add_argument("--text_lr", type=float, default=0.00001, help="learning rate for stage1")
-    parser.add_argument("--image_lr", type=float, default=0.0005, help="learning rate for stage2")
+    parser.add_argument(
+        "--text_lr", type=float, default=0.00001, help="learning rate for stage1"
+    )
+    parser.add_argument(
+        "--image_lr", type=float, default=0.0005, help="learning rate for stage2"
+    )
     parser.add_argument(
         "--criterion", type=str, default=["dice_loss", "focal_loss"], nargs="+"
     )
@@ -255,13 +262,27 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
-    parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
+    parser.add_argument(
+        "--disable_patch_graph",
+        action="store_true",
+        help="disable patch-level graph refinement",
+    )
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
     parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
-    parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
+    parser.add_argument(
+        "--disable_patch_graph_spatial",
+        action="store_true",
+        help="disable spatial edges in patch graph",
+    )
     parser.add_argument("--patch_graph_feature_temperature", type=float, default=0.2)
     parser.add_argument("--patch_graph_anomaly_temperature", type=float, default=0.2)
+    parser.add_argument(
+        "--clip_global_weight",
+        type=float,
+        default=0.2,
+        help="weight of the final CLIP CLS feature in image-level fusion",
+    )
     parser.add_argument("--noise_severity", type=float, default=0.06)
     parser.add_argument("--noise_consistency_weight", type=float, default=0.1)
     parser.add_argument("--lesion_preservation_weight", type=float, default=0.1)
@@ -269,6 +290,8 @@ def main():
     parser.add_argument("--boundary_margin", type=float, default=0.2)
 
     args = parser.parse_args()
+    if not 0.0 <= args.clip_global_weight <= 1.0:
+        parser.error("clip_global_weight must be in [0, 1]")
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -318,6 +341,7 @@ def main():
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
         patch_graph_feature_temperature=args.patch_graph_feature_temperature,
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
+        clip_global_weight=args.clip_global_weight,
     ).to(device)
     model.eval()
     for parameter in model.clipmodel.parameters():
@@ -344,7 +368,9 @@ def main():
         try:
             text_optimizer.load_state_dict(checkpoint["text_optimizer"])
         except ValueError:
-            logger.info("skip text optimizer state because trainable parameters changed")
+            logger.info(
+                "skip text optimizer state because trainable parameters changed"
+            )
         text_start_epoch = checkpoint["epoch"]
         adapt_text = not (text_start_epoch == (args.text_epoch - 1))
     elif args.text_epoch == 0:
@@ -360,7 +386,9 @@ def main():
         try:
             image_optimizer.load_state_dict(checkpoint["image_optimizer"])
         except ValueError:
-            logger.info("skip image optimizer state because trainable parameters changed")
+            logger.info(
+                "skip image optimizer state because trainable parameters changed"
+            )
     else:
         image_start_epoch = 0
     # ========================================================

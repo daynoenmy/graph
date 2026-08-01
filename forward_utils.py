@@ -4,13 +4,11 @@ import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from tqdm import tqdm
 from kornia.filters import gaussian_blur2d
 from dataset.constants import CLASS_NAMES, REAL_NAMES, PROMPTS
 from model.tokenizer import tokenize
 from sklearn.metrics import roc_auc_score, average_precision_score
 from dataset.constants import DATA_PATH
-from utils import cos_sim
 
 # ================================================================================================
 # The following code is used to get criterion for training
@@ -297,35 +295,29 @@ def calculate_lesion_preservation_losses(
         # The pre-graph primary feature is the preservation target. Detaching
         # it prevents the target and refined representation from drifting
         # together to reduce this constraint trivially.
-        cosine_distance = 1.0 - F.cosine_similarity(
-            refined, primary.detach(), dim=-1
-        )
+        cosine_distance = 1.0 - F.cosine_similarity(refined, primary.detach(), dim=-1)
         feature_losses.append(
-            (cosine_distance * flat_mask).sum()
-            / flat_mask.sum().clamp_min(1.0)
+            (cosine_distance * flat_mask).sum() / flat_mask.sum().clamp_min(1.0)
         )
 
         refined_grid = F.normalize(refined, dim=-1).view(
             refined.shape[0], grid_size, grid_size, refined.shape[-1]
         )
-        horizontal_boundary = (
-            patch_mask[:, :, 1:] != patch_mask[:, :, :-1]
-        ).float()
+        horizontal_boundary = (patch_mask[:, :, 1:] != patch_mask[:, :, :-1]).float()
         horizontal_distance = 1.0 - (
             refined_grid[:, :, 1:] * refined_grid[:, :, :-1]
         ).sum(dim=-1)
-        vertical_boundary = (
-            patch_mask[:, 1:, :] != patch_mask[:, :-1, :]
-        ).float()
+        vertical_boundary = (patch_mask[:, 1:, :] != patch_mask[:, :-1, :]).float()
         vertical_distance = 1.0 - (
             refined_grid[:, 1:, :] * refined_grid[:, :-1, :]
         ).sum(dim=-1)
         boundary_penalty = (
             F.relu(boundary_margin - horizontal_distance) * horizontal_boundary
         ).sum()
-        boundary_penalty = boundary_penalty + (
-            F.relu(boundary_margin - vertical_distance) * vertical_boundary
-        ).sum()
+        boundary_penalty = (
+            boundary_penalty
+            + (F.relu(boundary_margin - vertical_distance) * vertical_boundary).sum()
+        )
         boundary_count = horizontal_boundary.sum() + vertical_boundary.sum()
         boundary_losses.append(boundary_penalty / boundary_count.clamp_min(1.0))
 
@@ -345,7 +337,10 @@ def metrics_eval(
     image_preds: np.ndarray,
     class_names: str,
     domain: str,
+    medical_global_weight: float = 0.0,
 ):
+    if not 0.0 <= medical_global_weight <= 1.0:
+        raise ValueError("medical_global_weight must be in [0, 1]")
     if pixel_preds.max() != 1:
         pixel_preds = (pixel_preds - pixel_preds.min()) / (
             pixel_preds.max() - pixel_preds.min()
@@ -359,7 +354,9 @@ def metrics_eval(
     if domain != "Medical":
         image_preds = pmax_pred * 0.5 + image_preds * 0.5
     else:
-        image_preds = pmax_pred
+        image_preds = (
+            1.0 - medical_global_weight
+        ) * pmax_pred + medical_global_weight * image_preds
     # ================================================================================================
     # pixel level auc & ap
     pixel_label = pixel_label.flatten()
