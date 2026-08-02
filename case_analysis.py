@@ -12,7 +12,7 @@ Example on Windows::
       --dataset Liver ^
       --aa_save_path ./ckpt/baseline ^
       --aa_image_checkpoint image_adapter_1.pth ^
-      --v1_save_path ./ckpt/noise_graph_cls ^
+      --v1_save_path ./ckpt/noise_graph_cls_llm ^
       --v1_image_checkpoint image_adapter_1.pth ^
       --output_dir ./case_results/Liver
 
@@ -42,6 +42,11 @@ from dataset.constants import DATA_PATH
 from forward_utils import calculate_similarity_map, get_adapted_text_embedding
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
+from prompt_utils import (
+    DEFAULT_LLM_PROMPT_PATH,
+    PROMPT_SOURCES,
+    validate_checkpoint_prompt_metadata,
+)
 from utils import CLIP_MEAN, CLIP_STD, make_medical_noise_view, setup_seed
 
 
@@ -60,8 +65,24 @@ def checkpoint_state(checkpoint, key, path):
     return checkpoint[key]
 
 
-def load_image_checkpoint(model, path, device, expect_graph):
+def load_image_checkpoint(
+    model,
+    path,
+    device,
+    expect_graph,
+    prompt_source,
+    dataset_name,
+    llm_prompt_path,
+    global_text_temperature=None,
+):
     checkpoint = torch.load(path, map_location=device)
+    validate_checkpoint_prompt_metadata(
+        checkpoint,
+        prompt_source,
+        dataset_name,
+        llm_prompt_path,
+        f"image adapter checkpoint {path}",
+    )
     state = checkpoint_state(checkpoint, "image_adapter", path)
     has_graph_parameters = any(name.startswith("patch_graph.") for name in state)
     if expect_graph and not has_graph_parameters:
@@ -84,15 +105,42 @@ def load_image_checkpoint(model, path, device, expect_graph):
             f"checkpoint={checkpoint_global_weight}, "
             f"model={model.clip_global_weight}"
         )
+    if global_text_temperature is not None:
+        checkpoint_temperature = checkpoint.get("global_text_temperature")
+        if (
+            checkpoint_temperature is not None
+            and abs(float(checkpoint_temperature) - global_text_temperature) > 1e-8
+        ):
+            raise ValueError(
+                f"global_text_temperature mismatch for {path}: "
+                f"checkpoint={checkpoint_temperature}, "
+                f"argument={global_text_temperature}"
+            )
     model.image_adapter.load_state_dict(state, strict=True)
     return int(checkpoint.get("epoch", -1))
 
 
-def load_text_checkpoint(model, root, checkpoint_name, device, description):
+def load_text_checkpoint(
+    model,
+    root,
+    checkpoint_name,
+    device,
+    description,
+    prompt_source,
+    dataset_name,
+    llm_prompt_path,
+):
     if checkpoint_name.lower() == "none":
         return False, None
     path = resolve_checkpoint(root, checkpoint_name, description)
     checkpoint = torch.load(path, map_location=device)
+    validate_checkpoint_prompt_metadata(
+        checkpoint,
+        prompt_source,
+        dataset_name,
+        llm_prompt_path,
+        description,
+    )
     model.text_adapter.load_state_dict(
         checkpoint_state(checkpoint, "text_adapter", path), strict=True
     )
@@ -209,7 +257,10 @@ def predict_pair(
         v1_patch_features, v1_text_embeddings, args.img_size, args.dataset
     )
     v1_det_logits = v1_det_feature @ v1_text_embeddings
-    v1_det_score = (v1_det_logits[:, 1] + 1.0) / 2.0
+    v1_det_score = torch.softmax(
+        v1_det_logits * args.global_text_temperature,
+        dim=-1,
+    )[:, 1]
     v1_uncertainty = uncertainty_map(
         auxiliary["uncertainty"],
         args.img_size,
@@ -736,6 +787,8 @@ def dataset_image_summary(records, aa_epoch, v1_epoch, args):
                 "test noise severity": args.test_noise_severity,
                 "CLIP global feature weight": 0.0,
                 "medical global score weight": 0.0,
+                "prompt source": args.aa_prompt_source,
+                "global text temperature": np.nan,
             },
             {
                 "method": "V1 + CLS Score",
@@ -746,6 +799,8 @@ def dataset_image_summary(records, aa_epoch, v1_epoch, args):
                 "test noise severity": args.test_noise_severity,
                 "CLIP global feature weight": args.clip_global_weight,
                 "medical global score weight": args.medical_image_score_global_weight,
+                "prompt source": args.v1_prompt_source,
+                "global text temperature": args.global_text_temperature,
             },
         ]
     )
@@ -770,6 +825,10 @@ def write_analysis_info(
         f"primary test noise severity: {args.test_noise_severity}",
         f"V1 CLIP global feature weight: {args.clip_global_weight}",
         f"V1 medical global score weight: {args.medical_image_score_global_weight}",
+        f"AA prompt source: {args.aa_prompt_source}",
+        f"V1 prompt source: {args.v1_prompt_source}",
+        f"LLM prompt bank: {args.llm_prompt_path}",
+        f"V1 global text temperature: {args.global_text_temperature}",
         f"seed: {args.seed}",
         f"AA heatmap global bounds: {bounds['aa']}",
         f"V1 heatmap global bounds: {bounds['v1']}",
@@ -804,11 +863,28 @@ def parse_args():
         "--aa_image_checkpoint", type=str, default="image_adapter_1.pth"
     )
     parser.add_argument("--aa_text_checkpoint", type=str, default="text_adapter.pth")
-    parser.add_argument("--v1_save_path", type=str, default="ckpt/noise_graph_cls")
+    parser.add_argument("--v1_save_path", type=str, default="ckpt/noise_graph_cls_llm")
     parser.add_argument(
         "--v1_image_checkpoint", type=str, default="image_adapter_1.pth"
     )
     parser.add_argument("--v1_text_checkpoint", type=str, default="text_adapter.pth")
+    parser.add_argument(
+        "--aa_prompt_source",
+        choices=PROMPT_SOURCES,
+        default="template",
+        help="prompt source used to train the AA-CLIP text checkpoint",
+    )
+    parser.add_argument(
+        "--v1_prompt_source",
+        choices=PROMPT_SOURCES,
+        default="llm",
+        help="prompt source used to train the V1 text checkpoint",
+    )
+    parser.add_argument(
+        "--llm_prompt_path",
+        type=str,
+        default=str(DEFAULT_LLM_PROMPT_PATH),
+    )
 
     parser.add_argument("--relu", action="store_true")
     parser.add_argument("--text_adapt_weight", type=float, default=0.1)
@@ -832,6 +908,12 @@ def parse_args():
         type=float,
         default=0.2,
         help="weight of the V1 global score in medical image scoring",
+    )
+    parser.add_argument(
+        "--global_text_temperature",
+        type=float,
+        default=10.0,
+        help="temperature for V1 normal/abnormal global text probabilities",
     )
     parser.add_argument(
         "--noise_severity",
@@ -867,6 +949,8 @@ def parse_args():
         parser.error("clip_global_weight must be in [0, 1]")
     if not 0 <= args.medical_image_score_global_weight <= 1:
         parser.error("medical_image_score_global_weight must be in [0, 1]")
+    if args.global_text_temperature <= 0:
+        parser.error("global_text_temperature must be positive")
     if args.panel_size < 128:
         parser.error("panel_size must be at least 128")
     if args.output_dir is None:
@@ -935,14 +1019,34 @@ def main():
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
         clip_global_weight=args.clip_global_weight,
     ).to(device)
-    aa_epoch = load_image_checkpoint(aa_model, aa_image_path, device, False)
-    v1_epoch = load_image_checkpoint(v1_model, v1_image_path, device, True)
+    aa_epoch = load_image_checkpoint(
+        aa_model,
+        aa_image_path,
+        device,
+        False,
+        args.aa_prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
+    )
+    v1_epoch = load_image_checkpoint(
+        v1_model,
+        v1_image_path,
+        device,
+        True,
+        args.v1_prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
+        args.global_text_temperature,
+    )
     aa_adapt_text, aa_text_path = load_text_checkpoint(
         aa_model,
         args.aa_save_path,
         args.aa_text_checkpoint,
         device,
         "AA-CLIP text checkpoint",
+        args.aa_prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
     )
     v1_adapt_text, v1_text_path = load_text_checkpoint(
         v1_model,
@@ -950,6 +1054,9 @@ def main():
         args.v1_text_checkpoint,
         device,
         "V1 text checkpoint",
+        args.v1_prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
     )
     aa_model.eval()
     v1_model.eval()
@@ -964,10 +1071,20 @@ def main():
     )
     with torch.inference_mode():
         aa_text_embeddings = get_adapted_text_embedding(
-            aa_model, args.dataset, device, adapt_text=aa_adapt_text
+            aa_model,
+            args.dataset,
+            device,
+            adapt_text=aa_adapt_text,
+            prompt_source=args.aa_prompt_source,
+            llm_prompt_path=args.llm_prompt_path,
         )
         v1_text_embeddings = get_adapted_text_embedding(
-            v1_model, args.dataset, device, adapt_text=v1_adapt_text
+            v1_model,
+            args.dataset,
+            device,
+            adapt_text=v1_adapt_text,
+            prompt_source=args.v1_prompt_source,
+            llm_prompt_path=args.llm_prompt_path,
         )
 
     records, bounds = collect_case_records(

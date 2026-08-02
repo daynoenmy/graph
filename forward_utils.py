@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from kornia.filters import gaussian_blur2d
 from dataset.constants import CLASS_NAMES, REAL_NAMES, PROMPTS
 from model.tokenizer import tokenize
+from prompt_utils import get_llm_state_prompts, resolve_prompt_source
 from sklearn.metrics import roc_auc_score, average_precision_score
 from dataset.constants import DATA_PATH
 
@@ -124,32 +125,63 @@ class BinaryDiceLoss(nn.Module):
 
 # ================================================================================================
 # The following code is used to get adapted text embeddings
-prompt = PROMPTS
-prompt_normal = prompt["prompt_normal"]
-prompt_abnormal = prompt["prompt_abnormal"]
-prompt_state = [prompt_normal, prompt_abnormal]
-prompt_templates = prompt["prompt_templates"]
-
-
-def get_adapted_single_class_text_embedding(
-    model, dataset_name, class_name, device, adapt_text=True
+def get_state_prompt_sentences(
+    dataset_name,
+    class_name,
+    prompt_source="template",
+    llm_prompt_path=None,
 ):
     if class_name == "object":
         real_name = class_name
     else:
         assert class_name in CLASS_NAMES[dataset_name], (
-            f"class_name {class_name} not found; available class_names: {CLASS_NAMES[dataset_name]}"
+            f"class_name {class_name} not found; available class_names: "
+            f"{CLASS_NAMES[dataset_name]}"
         )
         real_name = REAL_NAMES[dataset_name][class_name]
+
+    resolved_source = resolve_prompt_source(
+        prompt_source, dataset_name, llm_prompt_path
+    )
+    if resolved_source == "llm":
+        return get_llm_state_prompts(
+            dataset_name,
+            class_name,
+            real_name,
+            llm_prompt_path,
+        )
+
+    state_prompts = [PROMPTS["prompt_normal"], PROMPTS["prompt_abnormal"]]
+    prompted_states = []
+    for prompts in state_prompts:
+        sentences = []
+        for prompt in prompts:
+            state = prompt.format(real_name)
+            for template in PROMPTS["prompt_templates"]:
+                sentences.append(template.format(state))
+        prompted_states.append(sentences)
+    return prompted_states
+
+
+def get_adapted_single_class_text_embedding(
+    model,
+    dataset_name,
+    class_name,
+    device,
+    adapt_text=True,
+    prompt_source="template",
+    llm_prompt_path=None,
+):
+    prompted_states = get_state_prompt_sentences(
+        dataset_name,
+        class_name,
+        prompt_source,
+        llm_prompt_path,
+    )
     text_features = []
-    for i in range(len(prompt_state)):
-        prompted_state = [state.format(real_name) for state in prompt_state[i]]
-        prompted_sentence = []
-        for s in prompted_state:
-            for template in prompt_templates:
-                prompted_sentence.append(template.format(s))
-        prompted_sentence = tokenize(prompted_sentence).to(device)
-        class_embeddings = model.encode_text(prompted_sentence, adapt_text=adapt_text)
+    for sentences in prompted_states:
+        tokenized_sentences = tokenize(sentences).to(device)
+        class_embeddings = model.encode_text(tokenized_sentences, adapt_text=adapt_text)
         class_embeddings = class_embeddings / class_embeddings.norm(
             dim=-1, keepdim=True
         )
@@ -161,32 +193,48 @@ def get_adapted_single_class_text_embedding(
 
 
 def get_adapted_single_sentence_text_embedding(
-    model, dataset_name, class_name, device, adapt_text=True
+    model,
+    dataset_name,
+    class_name,
+    device,
+    adapt_text=True,
+    prompt_source="template",
+    llm_prompt_path=None,
 ):
-    assert class_name in CLASS_NAMES[dataset_name], (
-        f"class_name {class_name} not found; available class_names: {CLASS_NAMES[dataset_name]}"
+    prompted_states = get_state_prompt_sentences(
+        dataset_name,
+        class_name,
+        prompt_source,
+        llm_prompt_path,
     )
-    real_name = REAL_NAMES[dataset_name][class_name]
     text_features = []
-    for i in range(len(prompt_state)):
-        prompted_state = [state.format(real_name) for state in prompt_state[i]]
-        prompted_sentence = []
-        for s in prompted_state:
-            for template in prompt_templates:
-                prompted_sentence.append(template.format(s))
-        prompted_sentence = tokenize(prompted_sentence).to(device)
-        class_embeddings = model.encode_text(prompted_sentence, adapt_text=adapt_text)
+    for sentences in prompted_states:
+        tokenized_sentences = tokenize(sentences).to(device)
+        class_embeddings = model.encode_text(tokenized_sentences, adapt_text=adapt_text)
         class_embeddings = F.normalize(class_embeddings, dim=-1)
         text_features.append(class_embeddings)
     text_features = torch.cat(text_features, dim=0).to(device)
     return text_features
 
 
-def get_adapted_text_embedding(model, dataset_name, device, adapt_text=True):
+def get_adapted_text_embedding(
+    model,
+    dataset_name,
+    device,
+    adapt_text=True,
+    prompt_source="template",
+    llm_prompt_path=None,
+):
     ret_dict = {}
     for class_name in CLASS_NAMES[dataset_name]:
         text_features = get_adapted_single_class_text_embedding(
-            model, dataset_name, class_name, device, adapt_text=adapt_text
+            model,
+            dataset_name,
+            class_name,
+            device,
+            adapt_text=adapt_text,
+            prompt_source=prompt_source,
+            llm_prompt_path=llm_prompt_path,
         )
         ret_dict[class_name] = text_features
     return ret_dict

@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import logging
+import re
 from glob import glob
 from pandas import DataFrame, Series
 import torch
@@ -20,6 +21,11 @@ from forward_utils import (
     metrics_eval,
     visualize,
 )
+from prompt_utils import (
+    DEFAULT_LLM_PROMPT_PATH,
+    PROMPT_SOURCES,
+    validate_checkpoint_prompt_metadata,
+)
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -33,6 +39,13 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = str(cpu_num)
 os.environ["NUMEXPR_NUM_THREADS"] = str(cpu_num)
 torch.set_num_threads(cpu_num)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def checkpoint_sort_key(path):
+    match = re.search(r"image_adapter_(\d+)\.pth$", os.path.basename(path))
+    if match:
+        return (0, int(match.group(1)))
+    return (1, os.path.basename(path))
 
 
 def get_support_features(model, support_loader, device):
@@ -57,6 +70,7 @@ def get_predictions(
     img_size: int,
     dataset: str = "MVTec",
     noise_severity: float = 0.06,
+    global_text_temperature: float = 10.0,
 ):
     masks = []
     labels = []
@@ -87,8 +101,11 @@ def get_predictions(
         )
         # calculate similarity and get prediction
         # cls_preds = []
-        pred = det_feature @ epoch_text_feature
-        pred = (pred[:, 1] + 1) / 2
+        global_logits = det_feature @ epoch_text_feature
+        pred = torch.softmax(
+            global_logits * global_text_temperature,
+            dim=-1,
+        )[:, 1]
         preds_image.append(pred.cpu().numpy())
         patch_preds = []
         for f in patch_features:
@@ -107,7 +124,7 @@ def get_predictions(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Training")
+    parser = argparse.ArgumentParser(description="Testing")
     # model
     parser.add_argument(
         "--model_name",
@@ -124,6 +141,23 @@ def main():
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
+    parser.add_argument(
+        "--image_checkpoint",
+        type=str,
+        default="image_adapter_*.pth",
+        help="checkpoint file name or glob pattern relative to save_path",
+    )
+    parser.add_argument(
+        "--prompt_source",
+        choices=PROMPT_SOURCES,
+        default="auto",
+        help="auto uses the offline LLM bank when the dataset is registered",
+    )
+    parser.add_argument(
+        "--llm_prompt_path",
+        type=str,
+        default=str(DEFAULT_LLM_PROMPT_PATH),
+    )
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--text_norm_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_weight", type=float, default=0.1)
@@ -158,12 +192,20 @@ def main():
         default=0.2,
         help="weight of the fused global score in medical Image AUC/AP",
     )
+    parser.add_argument(
+        "--global_text_temperature",
+        type=float,
+        default=10.0,
+        help="temperature for normal/abnormal global text probabilities",
+    )
 
     args = parser.parse_args()
     if not 0.0 <= args.clip_global_weight <= 1.0:
         parser.error("clip_global_weight must be in [0, 1]")
     if not 0.0 <= args.medical_image_score_global_weight <= 1.0:
         parser.error("medical_image_score_global_weight must be in [0, 1]")
+    if args.global_text_temperature <= 0.0:
+        parser.error("global_text_temperature must be positive")
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -208,18 +250,38 @@ def main():
     model.eval()
     # load checkpoints if exists
     text_file = glob(args.save_path + "/text_adapter.pth")
-    assert len(text_file) >= 0, "text adapter checkpoint not found"
     if len(text_file) > 0:
-        checkpoint = torch.load(text_file[0])
+        checkpoint = torch.load(text_file[0], map_location=device)
+        validate_checkpoint_prompt_metadata(
+            checkpoint,
+            args.prompt_source,
+            args.dataset,
+            args.llm_prompt_path,
+            "text adapter checkpoint",
+        )
         model.text_adapter.load_state_dict(checkpoint["text_adapter"])
         adapt_text = True
     else:
         adapt_text = False
 
-    files = sorted(glob(args.save_path + "/image_adapter_2.pth"))
-    assert len(files) > 0, "image adapter checkpoint not found"
+    files = sorted(
+        glob(os.path.join(args.save_path, args.image_checkpoint)),
+        key=checkpoint_sort_key,
+    )
+    if not files:
+        raise FileNotFoundError(
+            "image adapter checkpoint not found: "
+            f"{os.path.join(args.save_path, args.image_checkpoint)}"
+        )
     for file in files:
-        checkpoint = torch.load(file)
+        checkpoint = torch.load(file, map_location=device)
+        validate_checkpoint_prompt_metadata(
+            checkpoint,
+            args.prompt_source,
+            args.dataset,
+            args.llm_prompt_path,
+            f"image adapter checkpoint {file}",
+        )
         checkpoint_global_weight = checkpoint.get("clip_global_weight")
         if (
             checkpoint_global_weight is not None
@@ -229,6 +291,16 @@ def main():
                 "clip_global_weight does not match checkpoint: "
                 f"checkpoint={checkpoint_global_weight}, "
                 f"argument={args.clip_global_weight}"
+            )
+        checkpoint_temperature = checkpoint.get("global_text_temperature")
+        if (
+            checkpoint_temperature is not None
+            and abs(float(checkpoint_temperature) - args.global_text_temperature) > 1e-8
+        ):
+            raise ValueError(
+                "global_text_temperature does not match checkpoint: "
+                f"checkpoint={checkpoint_temperature}, "
+                f"argument={args.global_text_temperature}"
             )
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         test_epoch = checkpoint["epoch"]
@@ -249,11 +321,20 @@ def main():
         with torch.no_grad():
             if adapt_text:
                 text_embeddings = get_adapted_text_embedding(
-                    model, args.dataset, device
+                    model,
+                    args.dataset,
+                    device,
+                    prompt_source=args.prompt_source,
+                    llm_prompt_path=args.llm_prompt_path,
                 )
             else:
                 text_embeddings = get_adapted_text_embedding(
-                    model, args.dataset, device, adapt_text=False
+                    model,
+                    args.dataset,
+                    device,
+                    adapt_text=False,
+                    prompt_source=args.prompt_source,
+                    llm_prompt_path=args.llm_prompt_path,
                 )
         # ========================================================
         df = DataFrame(
@@ -282,6 +363,7 @@ def main():
                     img_size=args.img_size,
                     dataset=args.dataset,
                     noise_severity=args.noise_severity,
+                    global_text_temperature=args.global_text_temperature,
                 )
             # ========================================================
             if args.visualize:

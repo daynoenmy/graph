@@ -18,7 +18,7 @@ Windows example::
 
     python visualize_patch_states.py ^
       --dataset Liver ^
-      --save_path ./ckpt/noise_graph_cls ^
+      --save_path ./ckpt/noise_graph_cls_llm ^
       --image_checkpoint image_adapter_1.pth ^
       --label anomaly ^
       --case_index 0 ^
@@ -44,6 +44,14 @@ from dataset.constants import CLASS_NAMES, PROMPTS, REAL_NAMES
 from model.adapter import AdaptedCLIP
 from model.adapter_modules import _build_knn_patch_graph, _build_spatial_patch_graph
 from model.tokenizer import tokenize
+from prompt_utils import (
+    DEFAULT_LLM_PROMPT_PATH,
+    PROMPT_SOURCES,
+    get_llm_state_prompts,
+    prompt_checkpoint_metadata,
+    resolve_prompt_source,
+    validate_checkpoint_prompt_metadata,
+)
 from utils import (
     CLIP_MEAN,
     CLIP_STD,
@@ -85,8 +93,22 @@ def resolve_checkpoint(root, checkpoint_name, description):
     return path
 
 
-def load_v1_image_checkpoint(model, path, device):
+def load_v1_image_checkpoint(
+    model,
+    path,
+    device,
+    prompt_source,
+    dataset_name,
+    llm_prompt_path,
+):
     checkpoint = torch.load(path, map_location=device)
+    validate_checkpoint_prompt_metadata(
+        checkpoint,
+        prompt_source,
+        dataset_name,
+        llm_prompt_path,
+        f"image adapter checkpoint {path}",
+    )
     if "image_adapter" not in checkpoint:
         raise KeyError(f"checkpoint does not contain 'image_adapter': {path}")
     state = checkpoint["image_adapter"]
@@ -106,30 +128,70 @@ def load_v1_image_checkpoint(model, path, device):
     return int(checkpoint.get("epoch", -1))
 
 
-def load_text_checkpoint(model, root, checkpoint_name, device):
+def load_text_checkpoint(
+    model,
+    root,
+    checkpoint_name,
+    device,
+    prompt_source,
+    dataset_name,
+    llm_prompt_path,
+):
     if checkpoint_name.lower() == "none":
         return False, None
     path = resolve_checkpoint(root, checkpoint_name, "text adapter checkpoint")
     checkpoint = torch.load(path, map_location=device)
+    validate_checkpoint_prompt_metadata(
+        checkpoint,
+        prompt_source,
+        dataset_name,
+        llm_prompt_path,
+        f"text adapter checkpoint {path}",
+    )
     if "text_adapter" not in checkpoint:
         raise KeyError(f"checkpoint does not contain 'text_adapter': {path}")
     model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=True)
     return True, path
 
 
-def adapted_text_embedding(model, dataset_name, class_name, device, adapt_text):
+def adapted_text_embedding(
+    model,
+    dataset_name,
+    class_name,
+    device,
+    adapt_text,
+    prompt_source,
+    llm_prompt_path,
+):
     """Local dependency-light equivalent of get_adapted_text_embedding()."""
     if class_name not in CLASS_NAMES[dataset_name]:
         raise ValueError(f"class {class_name!r} is not registered for {dataset_name}")
     real_name = REAL_NAMES[dataset_name][class_name]
-    state_prompts = [PROMPTS["prompt_normal"], PROMPTS["prompt_abnormal"]]
+    resolved_source = resolve_prompt_source(
+        prompt_source,
+        dataset_name,
+        llm_prompt_path,
+    )
+    if resolved_source == "llm":
+        prompted_states = get_llm_state_prompts(
+            dataset_name,
+            class_name,
+            real_name,
+            llm_prompt_path,
+        )
+    else:
+        prompted_states = []
+        state_prompts = [PROMPTS["prompt_normal"], PROMPTS["prompt_abnormal"]]
+        for prompts in state_prompts:
+            sentences = []
+            for prompt in prompts:
+                state = prompt.format(real_name)
+                for template in PROMPTS["prompt_templates"]:
+                    sentences.append(template.format(state))
+            prompted_states.append(sentences)
+
     text_features = []
-    for prompts in state_prompts:
-        prompted_sentences = []
-        for prompt in prompts:
-            state = prompt.format(real_name)
-            for template in PROMPTS["prompt_templates"]:
-                prompted_sentences.append(template.format(state))
+    for prompted_sentences in prompted_states:
         tokens = tokenize(prompted_sentences).to(device)
         embeddings = model.encode_text(tokens, adapt_text=adapt_text)
         embeddings = F.normalize(embeddings, dim=-1)
@@ -610,10 +672,21 @@ def parse_args():
         default=None,
         help="exact metadata image_path; overrides --label and --case_index",
     )
-    parser.add_argument("--save_path", type=str, default="ckpt/noise_graph_cls")
+    parser.add_argument("--save_path", type=str, default="ckpt/noise_graph_cls_llm")
     parser.add_argument("--image_checkpoint", type=str, default="image_adapter_1.pth")
     parser.add_argument("--text_checkpoint", type=str, default="text_adapter.pth")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument(
+        "--prompt_source",
+        choices=PROMPT_SOURCES,
+        default="llm",
+        help="prompt source used to train the V1 checkpoint",
+    )
+    parser.add_argument(
+        "--llm_prompt_path",
+        type=str,
+        default=str(DEFAULT_LLM_PROMPT_PATH),
+    )
 
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -731,9 +804,27 @@ def main():
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
         clip_global_weight=args.clip_global_weight,
     ).to(device)
-    epoch = load_v1_image_checkpoint(model, image_checkpoint, device)
+    prompt_metadata = prompt_checkpoint_metadata(
+        args.prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
+    )
+    epoch = load_v1_image_checkpoint(
+        model,
+        image_checkpoint,
+        device,
+        args.prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
+    )
     adapt_text, text_checkpoint = load_text_checkpoint(
-        model, args.save_path, args.text_checkpoint, device
+        model,
+        args.save_path,
+        args.text_checkpoint,
+        device,
+        args.prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
     )
     model.eval()
 
@@ -764,7 +855,13 @@ def main():
 
     with torch.inference_mode():
         text_embeddings = adapted_text_embedding(
-            model, args.dataset, class_name, device, adapt_text
+            model,
+            args.dataset,
+            class_name,
+            device,
+            adapt_text,
+            args.prompt_source,
+            args.llm_prompt_path,
         )
         refined_features, _, auxiliary = model(
             image,
@@ -1035,6 +1132,9 @@ def main():
         f"checkpoint epoch: {epoch}",
         f"CLIP global feature weight: {args.clip_global_weight}",
         f"text checkpoint: {text_checkpoint or 'none (original CLIP text)'}",
+        f"prompt source: {prompt_metadata['prompt_source']}",
+        f"LLM prompt bank: {args.llm_prompt_path}",
+        f"LLM prompt bank SHA256: {prompt_metadata.get('llm_prompt_bank_sha256', 'n/a')}",
         f"feature level: {level_index} of {level_count}",
         f"patch grid: {grid_size} x {grid_size}",
         f"noise model: {noise_model_for_dataset(args.dataset)}",

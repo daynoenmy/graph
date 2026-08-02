@@ -27,7 +27,7 @@ V1 保留 AA-CLIP 的两阶段适配流程：
 总体数据流为：
 
 ```text
-正常/异常提示
+离线 LLM 正常/异常视觉描述库
       │
       ▼
 冻结的 CLIP Text Encoder + Text Adapter
@@ -53,8 +53,20 @@ CLIP 最终 CLS ─> 与图检测特征融合 ─> Global Score ─────�
 
 ## 3. 异常感知文本锚点
 
-给定正常文本提示和异常文本提示，Text Adapter 在冻结 CLIP 文本编码器的基础上
-生成正常与异常文本锚点：
+V1 不在训练循环中调用在线 LLM。开发阶段先让 LLM 根据 MRI、CT、超声、眼底和
+内镜的可见成像特征生成正常/异常描述，并将审核后的固定文本保存到
+`dataset/llm_prompts.json`。每个医学数据集当前包含 6 条正常描述和 6 条异常描述。
+描述聚焦于可见的强度、纹理、边界和结构变化，不把不可观察的具体诊断当作事实。
+
+对状态 \(s\in\{n,a\}\) 的第 \(k\) 条描述 \(p_{s,k}\)，Text Adapter 在冻结 CLIP
+文本编码器的基础上编码并进行提示集成：
+
+\[
+e_{s,k}=\operatorname{Norm}(E_{\mathrm{text}}(p_{s,k})),\qquad
+t_s=\operatorname{Norm}\left(\frac{1}{K_s}\sum_k e_{s,k}\right).
+\]
+
+由此得到正常与异常文本锚点：
 
 \[
 T=[t_n,t_a], \qquad t_n,t_a\in\mathbb{R}^{D}.
@@ -69,6 +81,11 @@ T=[t_n,t_a], \qquad t_n,t_a\in\mathbb{R}^{D}.
 - 产生图传播所需的异常先验；
 - 计算双视图预测一致性；
 - 生成最终异常热图。
+
+训练、测试、病例分析和 Patch 状态可视化读取同一 Prompt Bank。checkpoint 保存
+`prompt_source` 和 Prompt Bank 的 SHA256；如果测试时文本文件发生变化，程序会拒绝
+加载，避免训练/测试文本语义静默不一致。旧 checkpoint 使用
+`--prompt_source template`，不能直接冒充 LLM 文本实验。
 
 ## 4. 模态相关辅助噪声视图
 
@@ -297,8 +314,16 @@ Z_{\mathrm{img}}
 \]
 
 当前默认 `clip_global_weight=0.2`，即保留 80% 图检测表示并加入 20% CLIP
-全局语义锚点。随后由 $Z_{\mathrm{img}}$ 与文本锚点得到全局异常分数
-$S_{\mathrm{global}}$。医学图像最终得分为：
+全局语义锚点。随后同时比较正常与异常文本锚点：
+
+\[
+\ell=\tau Z_{\mathrm{img}}^\top[t_n,t_a],\qquad
+S_{\mathrm{global}}=\operatorname{Softmax}(\ell)_a,
+\]
+
+其中默认温度 `global_text_temperature=10.0`。因此全局分数是正常/异常竞争后的异常
+概率，而不是仅把异常余弦相似度从 \([-1,1]\) 映射到 \([0,1]\)。医学图像最终
+得分为：
 
 \[
 S_{\mathrm{image}}
@@ -317,7 +342,8 @@ Pixel AUC/AP 仍完全由局部热图
 
 \[
 \mathcal L_{\mathrm{cls}}
-=\operatorname{CE}(S_{\mathrm{det}},y).
+=\operatorname{CE}
+\left(\tau Z_{\mathrm{img}}^\top[t_n,t_a],y\right).
 \]
 
 ### 12.2 多尺度分割损失
@@ -401,6 +427,7 @@ boundary_margin = 0.20
 - 生成源域模态对应的辅助噪声视图；
 - mask 只进入分割、病灶保持和边界损失；
 - CLIP 主干冻结；
+- 从固定的离线 LLM Prompt Bank 构造正常/异常文本锚点；
 - Text Adapter 在第一阶段训练；
 - Image Adapter 与 Patch Graph 在第二阶段训练。
 - 图像分类损失作用于图检测特征与最终 CLIP CLS 的融合表示。
@@ -408,6 +435,7 @@ boundary_margin = 0.20
 ### 推理阶段
 
 - 输入目标数据集图像；
+- 使用目标医学模态在同一 Prompt Bank 中对应的正常/异常描述；
 - 根据目标数据集生成模态对应的辅助噪声视图；
 - 不使用目标图像标签或病灶 mask；
 - 通过双视图估计不确定性并完成图传播；
@@ -417,15 +445,15 @@ boundary_margin = 0.20
 当前 `test.py` 中的 `--noise_severity` 只控制**内部辅助噪声视图**。当前版本没有给
 主测试输入额外加噪，因此默认测试仍然是“干净主输入 + 噪声辅助探针”。
 
-另外，当前 `test.py` 将图像 checkpoint 固定为：
+当前 `test.py` 默认使用：
 
 ```text
-image_adapter_2.pth
+--image_checkpoint image_adapter_*.pth
 ```
 
-因此它不会自动测试第一轮或全部轮次。如果论文实验采用第一轮 V1，必须显式修改
-checkpoint，或者使用独立的批量评估脚本；同时应通过验证协议预先确定轮次，不能按
-目标测试集结果逐数据集选择不同 checkpoint。
+因此会按 epoch 数值顺序测试所有编号 checkpoint；也可以传入单个文件名只测指定
+轮次。批量测试只用于完整报告或按预先规定的验证协议选轮次，不能查看目标测试集后
+再为 Liver、DDTI 等数据集分别挑选不同的最佳 epoch。
 
 ## 14. V1 的主要创新点
 
@@ -540,15 +568,16 @@ V1 使用 \((P+R)/2\) 作为图输入。当辅助噪声过强时，噪声特征�
 
 为证明每个模块的贡献，建议使用相同训练数据、随机种子和 checkpoint 选择策略进行：
 
-| 实验 | 噪声视图 | Patch Graph | 不确定性 | 异常门控 | 病灶约束 | CLS锚点 | 全局评分融合 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| AA-CLIP | × | × | × | × | × | × | × |
-| Graph only | × | ✓ | × | × | × | × | × |
-| Noise-aware Graph | ✓ | ✓ | ✓ | × | × | × | × |
-| Noise + Anomaly Gate | ✓ | ✓ | ✓ | ✓ | × | × | × |
-| 原 V1 Full | ✓ | ✓ | ✓ | ✓ | ✓ | × | × |
-| V1 + CLS | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | × |
-| V1 + CLS Score | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 实验 | 噪声视图 | Patch Graph | 不确定性 | 异常门控 | 病灶约束 | CLS锚点 | 全局评分融合 | LLM文本 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AA-CLIP | × | × | × | × | × | × | × | × |
+| Graph only | × | ✓ | × | × | × | × | × | × |
+| Noise-aware Graph | ✓ | ✓ | ✓ | × | × | × | × | × |
+| Noise + Anomaly Gate | ✓ | ✓ | ✓ | ✓ | × | × | × | × |
+| 原 V1 Full | ✓ | ✓ | ✓ | ✓ | ✓ | × | × | × |
+| V1 + CLS | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | × | × |
+| V1 + CLS Score | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | × |
+| V1 + CLS Score + LLM | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 还应报告：
 

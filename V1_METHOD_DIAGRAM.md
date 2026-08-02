@@ -5,12 +5,17 @@ flowchart LR
     %% ===================== Text branch =====================
     subgraph BASE["(a) AA-CLIP 基础模块"]
         direction TB
-        NP["正常文本提示"]:::cInput
-        AP["异常文本提示"]:::cInput
+        LLM["离线 LLM<br/>按医学模态生成视觉描述"]:::cInput
+        BANK["固定 Prompt Bank<br/>每类 6 条正常 + 6 条异常"]:::cInput
+        NP["正常描述集合"]:::cInput
+        AP["异常描述集合"]:::cInput
         TE["冻结的 CLIP 文本编码器"]:::cFrozen
         TA["Text Adapter"]:::cTrainable
-        ANCHOR["正常/异常文本锚点<br/>t_n, t_a"]:::cAnchor
+        ANCHOR["描述集成后的文本锚点<br/>t_n, t_a"]:::cAnchor
 
+        LLM --> BANK
+        BANK --> NP
+        BANK --> AP
         NP --> TE
         AP --> TE
         TE --> TA --> ANCHOR
@@ -93,7 +98,7 @@ flowchart LR
         PMAX["局部图像分数<br/>S_pixel=max M(x,y)"]:::cPrediction
         DET["图检测特征<br/>Z_g=Mean(F'_det)"]:::cPrediction
         GFUSE["CLS—图全局融合<br/>Z_img=Norm(0.8Z_g+0.2C)"]:::cGraphStrong
-        GSCORE["全局异常分数<br/>S_global"]:::cPrediction
+        GSCORE["正常/异常竞争<br/>S_global=Softmax(temperature × similarity)_abnormal"]:::cPrediction
         FINAL["医学图像评分<br/>S_image=0.8S_pixel+0.2S_global"]:::cImageScore
 
         REFINE --> SIM
@@ -113,7 +118,7 @@ flowchart LR
         LCONS["L_cons<br/>双视图预测一致性"]:::cLoss
         LPRES["L_pres<br/>病灶特征保持"]:::cLoss
         LBOUND["L_boundary<br/>病灶边界对比"]:::cLoss
-        LCLS["L_cls<br/>图像分类"]:::cLoss
+        LCLS["L_cls<br/>温度缩放双文本分类"]:::cLoss
         LTOTAL["总目标<br/>L=L_cls+L_seg+λ_cL_cons+λ_pL_pres+λ_bL_boundary"]:::cTotalLoss
 
         GT -.-> LSEG

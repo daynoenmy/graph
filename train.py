@@ -22,6 +22,12 @@ from forward_utils import (
     calculate_noise_consistency_loss,
     calculate_lesion_preservation_losses,
 )
+from prompt_utils import (
+    DEFAULT_LLM_PROMPT_PATH,
+    PROMPT_SOURCES,
+    prompt_checkpoint_metadata,
+    validate_checkpoint_prompt_metadata,
+)
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -50,6 +56,9 @@ def train_text_adapter(
     text_epoch: int,
     dataset_name: str,
     img_size: int,
+    prompt_source: str,
+    llm_prompt_path: str,
+    prompt_metadata: dict,
     logger: logging.Logger,
 ):
     for epoch in range(start_epoch, text_epoch):
@@ -77,7 +86,12 @@ def train_text_adapter(
             epoch_text_feature_dict = {}
             for class_name in list(set(class_names)):
                 text_embedding = get_adapted_single_class_text_embedding(
-                    adapted_model, dataset_name, class_name, device
+                    adapted_model,
+                    dataset_name,
+                    class_name,
+                    device,
+                    prompt_source=prompt_source,
+                    llm_prompt_path=llm_prompt_path,
                 )
                 epoch_text_feature_dict[class_name] = text_embedding
             epoch_text_feature = torch.stack(
@@ -110,6 +124,7 @@ def train_text_adapter(
                 "epoch": epoch + 1,
                 "text_adapter": adapted_model.text_adapter.state_dict(),
                 "text_optimizer": optimizer.state_dict(),
+                **prompt_metadata,
             },
             ckp_path,
         )
@@ -133,6 +148,8 @@ def train_image_adapter(
     lesion_preservation_weight: float,
     boundary_contrast_weight: float,
     boundary_margin: float,
+    global_text_temperature: float,
+    prompt_metadata: dict,
     logger: logging.Logger,
 ):
     for epoch in range(start_epoch, image_epoch):
@@ -166,7 +183,10 @@ def train_image_adapter(
             # calculate similarity and get prediction
             loss = 0.0
             det_feature = det_feature.unsqueeze(1)
-            cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
+            cls_preds = (
+                torch.matmul(det_feature, epoch_text_feature)[:, 0]
+                * global_text_temperature
+            )
             loss += F.cross_entropy(cls_preds, label)
             for f in patch_features:
                 # text-image alignment
@@ -206,6 +226,8 @@ def train_image_adapter(
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
             "clip_global_weight": model.clip_global_weight,
+            "global_text_temperature": global_text_temperature,
+            **prompt_metadata,
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -256,6 +278,17 @@ def main():
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
+    parser.add_argument(
+        "--prompt_source",
+        choices=PROMPT_SOURCES,
+        default="auto",
+        help="auto uses the offline LLM bank when the dataset is registered",
+    )
+    parser.add_argument(
+        "--llm_prompt_path",
+        type=str,
+        default=str(DEFAULT_LLM_PROMPT_PATH),
+    )
     # hyper-parameters
     parser.add_argument("--text_norm_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_weight", type=float, default=0.1)
@@ -283,6 +316,12 @@ def main():
         default=0.2,
         help="weight of the final CLIP CLS feature in image-level fusion",
     )
+    parser.add_argument(
+        "--global_text_temperature",
+        type=float,
+        default=10.0,
+        help="temperature for normal/abnormal global text logits",
+    )
     parser.add_argument("--noise_severity", type=float, default=0.06)
     parser.add_argument("--noise_consistency_weight", type=float, default=0.1)
     parser.add_argument("--lesion_preservation_weight", type=float, default=0.1)
@@ -292,6 +331,13 @@ def main():
     args = parser.parse_args()
     if not 0.0 <= args.clip_global_weight <= 1.0:
         parser.error("clip_global_weight must be in [0, 1]")
+    if args.global_text_temperature <= 0.0:
+        parser.error("global_text_temperature must be positive")
+    prompt_metadata = prompt_checkpoint_metadata(
+        args.prompt_source,
+        args.dataset,
+        args.llm_prompt_path,
+    )
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -364,6 +410,13 @@ def main():
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
+        validate_checkpoint_prompt_metadata(
+            checkpoint,
+            args.prompt_source,
+            args.dataset,
+            args.llm_prompt_path,
+            "text adapter checkpoint",
+        )
         model.text_adapter.load_state_dict(checkpoint["text_adapter"])
         try:
             text_optimizer.load_state_dict(checkpoint["text_optimizer"])
@@ -381,6 +434,23 @@ def main():
     file = glob(args.save_path + "/image_adapter.pth")
     if len(file) > 0:
         checkpoint = torch.load(file[0])
+        validate_checkpoint_prompt_metadata(
+            checkpoint,
+            args.prompt_source,
+            args.dataset,
+            args.llm_prompt_path,
+            "image adapter checkpoint",
+        )
+        checkpoint_temperature = checkpoint.get("global_text_temperature")
+        if (
+            checkpoint_temperature is not None
+            and abs(float(checkpoint_temperature) - args.global_text_temperature) > 1e-8
+        ):
+            raise ValueError(
+                "global_text_temperature does not match checkpoint: "
+                f"checkpoint={checkpoint_temperature}, "
+                f"argument={args.global_text_temperature}"
+            )
         image_start_epoch = checkpoint["epoch"]
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         try:
@@ -428,6 +498,9 @@ def main():
             save_path=args.save_path,
             text_epoch=args.text_epoch,
             img_size=args.img_size,
+            prompt_source=args.prompt_source,
+            llm_prompt_path=args.llm_prompt_path,
+            prompt_metadata=prompt_metadata,
             logger=logger,
         )
     del text_dataloader, text_dataset, clip_surgery, text_optimizer
@@ -435,10 +508,21 @@ def main():
     with torch.no_grad():
         if args.text_epoch == 0:
             text_embeddings = get_adapted_text_embedding(
-                model, args.dataset, device, adapt_text=False
+                model,
+                args.dataset,
+                device,
+                adapt_text=False,
+                prompt_source=args.prompt_source,
+                llm_prompt_path=args.llm_prompt_path,
             )
         else:
-            text_embeddings = get_adapted_text_embedding(model, args.dataset, device)
+            text_embeddings = get_adapted_text_embedding(
+                model,
+                args.dataset,
+                device,
+                prompt_source=args.prompt_source,
+                llm_prompt_path=args.llm_prompt_path,
+            )
     model = train_image_adapter(
         model=model,
         text_embeddings=text_embeddings,
@@ -456,6 +540,8 @@ def main():
         lesion_preservation_weight=args.lesion_preservation_weight,
         boundary_contrast_weight=args.boundary_contrast_weight,
         boundary_margin=args.boundary_margin,
+        global_text_temperature=args.global_text_temperature,
+        prompt_metadata=prompt_metadata,
         logger=logger,
     )
 

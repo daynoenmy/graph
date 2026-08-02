@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "language": "en",
+  "generation": {
+    "method": "offline LLM-authored prompt bank",
+    "generator_record": "LLM-assisted drafting in the development session; record the exact provider and model identifier before publication",
+    "generation_instruction": "For each medical imaging modality, write six normal and six abnormal English descriptions for CLIP. Describe only visible intensity, texture, boundary, symmetry, color, and structural cues; preserve modality context; avoid patient metadata and unsupported diagnoses; keep each description to one sentence.",
+    "intended_use": "normal/abnormal CLIP text anchors for medical anomaly detection",
+    "postprocessing": "deduplicate, verify normal/abnormal polarity, and retain the exact reviewed text for every experiment",
+    "constraints": [
+      "describe visible imaging appearance rather than a specific diagnosis",
+      "preserve modality context",
+      "avoid claims about pathology not observable in the image"
+    ]
+  },
+  "datasets": {
+    "Brain": {
+      "normal": [
+        "a brain MRI scan with symmetric anatomy and no focal abnormal signal",
+        "a normal brain MRI with homogeneous tissue appearance and preserved structural boundaries",
+        "a healthy brain scan showing balanced intensity patterns across corresponding regions",
+        "a brain MRI without a localized lesion, mass effect, or irregular tissue texture",
+        "a normal medical image of the brain with continuous anatomy and expected contrast",
+        "a brain scan whose local regions are consistent with the surrounding healthy tissue"
+      ],
+      "abnormal": [
+        "a brain MRI containing a focal region with signal intensity inconsistent with nearby tissue",
+        "an abnormal brain scan with a localized lesion-like area and heterogeneous texture",
+        "a brain MRI showing asymmetric tissue appearance or an irregular focal boundary",
+        "a pathological brain image containing a suspicious region that disrupts normal anatomy",
+        "a brain scan with a localized abnormality differing in contrast from surrounding tissue",
+        "an abnormal medical image of the brain with a focal structural or intensity irregularity"
+      ]
+    },
+    "Liver": {
+      "normal": [
+        "a liver CT scan with homogeneous parenchymal attenuation and no focal lesion",
+        "a normal liver scan with smooth boundaries and consistent internal texture",
+        "a healthy liver CT image showing uniform local intensity across the parenchyma",
+        "a liver scan without a localized mass-like region or irregular attenuation",
+        "a normal medical image of the liver with preserved shape and expected contrast",
+        "a liver CT whose local regions remain consistent with surrounding healthy tissue"
+      ],
+      "abnormal": [
+        "a liver CT scan containing a focal region with attenuation different from surrounding parenchyma",
+        "an abnormal liver image with a localized lesion-like area and heterogeneous texture",
+        "a liver CT showing an irregular focal boundary or disrupted internal appearance",
+        "a pathological liver scan containing a suspicious localized region",
+        "a liver image with a focal intensity abnormality inconsistent with nearby tissue",
+        "an abnormal medical image of the liver with a mass-like or structurally irregular area"
+      ]
+    },
+    "Retina": {
+      "normal": [
+        "a normal retinal fundus image with a clear vascular pattern and no focal abnormal region",
+        "a healthy retina with consistent background appearance and preserved anatomical structures",
+        "a retinal image showing regular vessels and no localized lesion-like texture",
+        "a normal fundus photograph without focal bright, dark, or irregular regions",
+        "a healthy retinal scan with coherent color and smooth local appearance",
+        "a retina whose local regions are visually consistent with surrounding tissue"
+      ],
+      "abnormal": [
+        "a retinal image containing a focal bright or dark region inconsistent with surrounding tissue",
+        "an abnormal fundus photograph with a localized lesion-like appearance",
+        "a retina showing irregular vascular or tissue texture in a focal region",
+        "a pathological retinal image containing a suspicious localized abnormality",
+        "a fundus image with disrupted local appearance or an irregular focal boundary",
+        "an abnormal retina containing a region whose color or texture differs from nearby tissue"
+      ]
+    },
+    "DDTI": {
+      "normal": [
+        "a normal thyroid ultrasound image with homogeneous echotexture and smooth tissue boundaries",
+        "a healthy thyroid ultrasound without a focal nodule-like region",
+        "a thyroid scan showing consistent speckle texture across nearby tissue",
+        "a normal ultrasound image with regular contour and no localized echogenic abnormality",
+        "a healthy thyroid image with coherent internal appearance and expected acoustic texture",
+        "a thyroid ultrasound whose local regions are consistent with surrounding tissue"
+      ],
+      "abnormal": [
+        "a thyroid ultrasound containing a focal region with echogenicity different from surrounding tissue",
+        "an abnormal thyroid scan with a localized nodule-like area and heterogeneous texture",
+        "a thyroid ultrasound showing an irregular focal boundary or disrupted echotexture",
+        "a pathological ultrasound image containing a suspicious localized region",
+        "a thyroid scan with a focal acoustic abnormality inconsistent with nearby tissue",
+        "an abnormal thyroid image with a structurally or texturally irregular area"
+      ]
+    },
+    "Colon": {
+      "normal": [
+        "a normal colonoscopy image with smooth mucosal texture and no protruding focal lesion",
+        "a healthy colon endoscopy view with consistent illumination and regular tissue appearance",
+        "a colonoscopy frame showing continuous mucosal structure without a localized abnormal region",
+        "a normal endoscopic image without an irregular raised or depressed area",
+        "a healthy colon image with coherent color, texture, and tissue boundaries",
+        "a colonoscopy image whose local regions are consistent with surrounding mucosa"
+      ],
+      "abnormal": [
+        "a colonoscopy image containing a focal region that differs in shape or texture from surrounding mucosa",
+        "an abnormal colon endoscopy view with a localized polyp-like or protruding area",
+        "a colonoscopy frame showing an irregular focal boundary and heterogeneous surface texture",
+        "a pathological endoscopic image containing a suspicious localized lesion",
+        "a colon image with a focal color or structural abnormality inconsistent with nearby mucosa",
+        "an abnormal colonoscopy image with a raised, depressed, or texturally irregular region"
+      ]
+    }
+  }
+}

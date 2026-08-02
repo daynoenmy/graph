@@ -62,15 +62,30 @@ medical image score combines 0.8 pixel-map maximum with 0.2 global score:
 
 ```bash
 python train.py --dataset Brain --training_mode full_shot \
-  --save_path ./ckpt/noise_graph_cls --clip_global_weight 0.2
+  --save_path ./ckpt/noise_graph_cls_llm \
+  --prompt_source llm --llm_prompt_path ./dataset/llm_prompts.json \
+  --clip_global_weight 0.2 --global_text_temperature 10.0
 
-python test.py --dataset Liver --save_path ./ckpt/noise_graph_cls \
-  --clip_global_weight 0.2 --medical_image_score_global_weight 0.2
+python test.py --dataset Liver --save_path ./ckpt/noise_graph_cls_llm \
+  --image_checkpoint 'image_adapter_*.pth' \
+  --prompt_source llm --llm_prompt_path ./dataset/llm_prompts.json \
+  --clip_global_weight 0.2 --global_text_temperature 10.0 \
+  --medical_image_score_global_weight 0.2
 ```
 
-Set both new weights to zero for the pre-CLS V1 ablation. The batch files use a
-separate ``noise_graph_cls`` directory so the original V1 checkpoints are not
-overwritten.
+The normal/abnormal anchors are ensembles of modality-specific visual
+descriptions authored offline with an LLM and stored in
+``dataset/llm_prompts.json``. No LLM API is called during training or testing.
+The prompt source and prompt-bank SHA256 are stored in every new checkpoint;
+loading a checkpoint with a different bank is rejected. The global score is
+the abnormal probability from a temperature-scaled normal/abnormal Softmax,
+not a rescaled abnormal cosine alone.
+
+Set both fusion weights to zero for the pre-CLS V1 ablation. Use
+``--prompt_source template`` when evaluating a checkpoint trained before the
+LLM prompt bank was introduced. The batch files use a separate
+``noise_graph_cls_llm`` directory, so previous V1 checkpoints are not
+overwritten. ``test.bat`` evaluates every numbered image checkpoint by default.
 
 The former diffusion-denoising experiment is retained for reference in
 [DENOISING.md](DENOISING.md), but its checkpoints are not consumed by the
@@ -83,7 +98,7 @@ python case_analysis.py \
   --dataset Liver \
   --aa_save_path ./ckpt/baseline \
   --aa_image_checkpoint image_adapter_1.pth \
-  --v1_save_path ./ckpt/noise_graph_cls \
+  --v1_save_path ./ckpt/noise_graph_cls_llm \
   --v1_image_checkpoint image_adapter_1.pth \
   --output_dir ./case_results/Liver
 ```
@@ -98,7 +113,7 @@ run:
 ```bash
 python visualize_patch_states.py \
   --dataset Liver \
-  --save_path ./ckpt/noise_graph_cls \
+  --save_path ./ckpt/noise_graph_cls_llm \
   --image_checkpoint image_adapter_1.pth \
   --label anomaly \
   --case_index 0 \
