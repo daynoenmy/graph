@@ -115,6 +115,17 @@ See [V3_METHOD.md](V3_METHOD.md) for the equations, architecture differences,
 medical interpretation, commands, and required ablations. The original V1
 entry points remain ``train.py`` and ``test.py``.
 
+BMAD mixed-supervision leave-one-dataset-out is supported with explicit mask
+availability and dataset-balanced source sampling:
+
+```bat
+train_v3_lodo.bat Chest
+test_v3_lodo.bat Chest
+```
+
+See [BMAD_LODO.md](BMAD_LODO.md) for dataset paths, optional-mask JSONL schema,
+the six folds, loss routing, metric rules, and target-domain leakage controls.
+
 For a paired medical case study against the original AA-CLIP, run:
 
 ```bash

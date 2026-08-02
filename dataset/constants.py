@@ -1,11 +1,52 @@
 import os
 
 
-BASE_PATH = "/home/sunhan"
+BASE_PATH = os.environ.get("GRAPH_DATA_ROOT", "/home/sunhan")
+BMAD_DATA_PATH_OVERRIDE = os.environ.get("BMAD_DATA_PATH")
+BMAD_BASE_PATH = BMAD_DATA_PATH_OVERRIDE or f"{BASE_PATH}/data/BMAD"
+
+
+def _bmad_or_legacy(subdirectory, legacy_path):
+    if BMAD_DATA_PATH_OVERRIDE:
+        return f"{BMAD_BASE_PATH}/{subdirectory}"
+    return legacy_path
+
+
+# Retina is the existing Retina_RESC benchmark name used by this repository.
+BMAD_DATASETS = (
+    "Brain",
+    "Liver",
+    "Retina",
+    "Chest",
+    "Retina_OCT2017",
+    "Histopathology",
+)
+
 DATA_PATH = {
-    "Brain": f"{BASE_PATH}/dataset/Brain_AD",
-    "Liver": f"{BASE_PATH}/dataset/Liver_AD",
-    "Retina": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
+    "Brain": os.environ.get(
+        "BRAIN_DATA_PATH",
+        _bmad_or_legacy("Brain", f"{BASE_PATH}/dataset/Brain_AD"),
+    ),
+    "Liver": os.environ.get(
+        "LIVER_DATA_PATH",
+        _bmad_or_legacy("Liver", f"{BASE_PATH}/dataset/Liver_AD"),
+    ),
+    "Retina": os.environ.get(
+        "RETINA_RESC_DATA_PATH",
+        _bmad_or_legacy("Retina_RESC", f"{BASE_PATH}/data/MedAD/Retina_RESC_AD"),
+    ),
+    "Chest": os.environ.get(
+        "CHEST_DATA_PATH",
+        f"{BMAD_BASE_PATH}/Chest",
+    ),
+    "Retina_OCT2017": os.environ.get(
+        "OCT2017_DATA_PATH",
+        f"{BMAD_BASE_PATH}/Retina_OCT2017",
+    ),
+    "Histopathology": os.environ.get(
+        "HISTOPATHOLOGY_DATA_PATH",
+        f"{BMAD_BASE_PATH}/Histopathology",
+    ),
     "Colon_clinicDB": f"{BASE_PATH}/data/Colon/CVC-ClinicDB",
     "Colon_colonDB": f"{BASE_PATH}/data/Colon/CVC-ColonDB",
     "Colon_cvc300": f"{BASE_PATH}/data/Colon/CVC-300",
@@ -21,6 +62,9 @@ CLASS_NAMES = {
     "Brain": ["Brain"],
     "Liver": ["Liver"],
     "Retina": ["Retina"],
+    "Chest": ["Chest"],
+    "Retina_OCT2017": ["Retina_OCT2017"],
+    "Histopathology": ["Histopathology"],
     "Colon_clinicDB": ["Colon_clinicDB"],
     "Colon_colonDB": ["Colon_colonDB"],
     "Colon_Kvasir": ["Kvasir"],
@@ -75,6 +119,9 @@ DOMAINS = {
     "Brain": "Medical",
     "Liver": "Medical",
     "Retina": "Medical",
+    "Chest": "Medical",
+    "Retina_OCT2017": "Medical",
+    "Histopathology": "Medical",
     "Colon_clinicDB": "Medical",
     "Colon_colonDB": "Medical",
     "Colon_Kvasir": "Medical",
@@ -84,7 +131,10 @@ DOMAINS = {
 REAL_NAMES = {
     "Brain": {"Brain": "scan"},
     "Liver": {"Liver": "scan"},
-    "Retina": {"Retina": "scan"},
+    "Retina": {"Retina": "retinal OCT scan"},
+    "Chest": {"Chest": "chest X-ray"},
+    "Retina_OCT2017": {"Retina_OCT2017": "retinal OCT scan"},
+    "Histopathology": {"Histopathology": "histopathology image"},
     "DDTI": {"DDTI": "thyroid ultrasound scan"},
     "MVTec": {
         "bottle": "dark bottle",

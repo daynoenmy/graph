@@ -1,13 +1,54 @@
-import os
 import json
 import math
-import random
+import os
+
 import torch
-from torch.utils.data import Dataset
-from utils import AddGaussianNoise
-from torchvision import transforms
 from PIL import Image
-from .constants import CLASS_NAMES, DATA_PATH, DOMAINS
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+from .constants import CLASS_NAMES, DATA_PATH
+
+
+def _read_metadata(meta_path):
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(
+            f"metadata file not found: {meta_path}; create a JSONL file before "
+            "training or evaluation"
+        )
+    metadata = []
+    with open(meta_path, encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            for required_key in ("image_path", "label", "class_name"):
+                if required_key not in item:
+                    raise ValueError(
+                        f"{meta_path}:{line_number} has no {required_key!r} field"
+                    )
+            metadata.append(item)
+    if not metadata:
+        raise ValueError(f"metadata file is empty: {meta_path}")
+    return metadata
+
+
+def _load_optional_anomaly_mask(meta, data_path, img_size, transform_mask):
+    """Return a placeholder mask plus explicit supervision availability."""
+    is_anomaly = bool(meta["label"])
+    mask_relative_path = meta.get("mask_path")
+    has_anomaly_mask = is_anomaly and bool(mask_relative_path)
+    if has_anomaly_mask:
+        mask_path = os.path.join(data_path, mask_relative_path)
+        mask = Image.open(mask_path).convert("L")
+        mask = (transform_mask(mask) != 0).float()
+    else:
+        mask = torch.zeros([1, img_size, img_size])
+
+    # A normal image is valid all-zero pixel supervision even without a mask
+    # file. An abnormal image without a mask has unknown pixel labels.
+    mask_valid = (not is_anomaly) or has_anomaly_mask
+    return mask, mask_valid, has_anomaly_mask
 
 
 class BaseDataset(Dataset):
@@ -17,15 +58,14 @@ class BaseDataset(Dataset):
         meta_path: str,
         img_size: int,
         text: bool = False,
+        dataset_name: str | None = None,
     ):
         self.data_path = data_path
         self.img_size = img_size
         self.text = text
-        self.meta = []
+        self.dataset_name = dataset_name
         self.full_shot = "full-shot" in meta_path
-        with open(meta_path, "r") as f:
-            for line in f:
-                self.meta.append(json.loads(line))
+        self.meta = _read_metadata(meta_path)
 
         self.transforms_list = [
             transforms.RandomApply(
@@ -78,13 +118,12 @@ class BaseDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
 
         img = self.transform_x(img)
-        if meta["label"]:
-            mask_path = os.path.join(data_path, meta["mask_path"])
-            mask = Image.open(mask_path).convert("L")
-            mask = self.transform_mask(mask)
-            mask = (mask != 0).float()
-        else:
-            mask = torch.zeros([1, self.img_size, self.img_size])
+        mask, mask_valid, has_anomaly_mask = _load_optional_anomaly_mask(
+            meta,
+            data_path,
+            self.img_size,
+            self.transform_mask,
+        )
 
         random_transform = transforms.Compose(self.transforms_list)
         transform_tensor = torch.cat([img, mask], dim=0)
@@ -99,6 +138,12 @@ class BaseDataset(Dataset):
             "label": torch.tensor(meta["label"]).to(torch.int64),
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
+            "dataset_name": self.dataset_name or meta.get("dataset_name", "unknown"),
+            "mask_valid": torch.tensor(mask_valid, dtype=torch.bool),
+            "has_anomaly_mask": torch.tensor(
+                has_anomaly_mask,
+                dtype=torch.bool,
+            ),
         }
         return inputs
 
@@ -110,18 +155,23 @@ class BaseSingleClassDataset(Dataset):
         meta_path: str,
         img_size: int,
         class_name: str,
+        dataset_name: str | None = None,
         logger=None,
     ):
 
         assert class_name is not None, "class_name should be provided"
         self.data_path = data_path
         self.img_size = img_size
-        self.meta = []
-        with open(meta_path, "r") as f:
-            for line in f:
-                m = json.loads(line.strip())
-                if m["class_name"] == class_name:
-                    self.meta.append(m)
+        self.dataset_name = dataset_name
+        self.meta = [
+            item
+            for item in _read_metadata(meta_path)
+            if item["class_name"] == class_name
+        ]
+        if not self.meta:
+            raise ValueError(
+                f"metadata {meta_path} has no samples for class {class_name!r}"
+            )
 
         # Define transforms
         self.transform_x = transforms.Compose(
@@ -155,19 +205,24 @@ class BaseSingleClassDataset(Dataset):
         img_path = os.path.join(self.data_path, meta["image_path"])
         img = Image.open(img_path).convert("RGB")
         img = self.transform_x(img)
-        if meta["label"]:
-            mask_path = os.path.join(self.data_path, meta["mask_path"])
-            mask = Image.open(mask_path).convert("L")
-            mask = self.transform_mask(mask)
-            mask = (mask != 0).float()
-        else:
-            mask = torch.zeros([1, self.img_size, self.img_size])
+        mask, mask_valid, has_anomaly_mask = _load_optional_anomaly_mask(
+            meta,
+            self.data_path,
+            self.img_size,
+            self.transform_mask,
+        )
         inputs = {
             "image": img,
             "mask": mask,
             "label": meta["label"],
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
+            "dataset_name": self.dataset_name or meta.get("dataset_name", "unknown"),
+            "mask_valid": torch.tensor(mask_valid, dtype=torch.bool),
+            "has_anomaly_mask": torch.tensor(
+                has_anomaly_mask,
+                dtype=torch.bool,
+            ),
         }
         return inputs
 
@@ -196,9 +251,24 @@ def get_dataset(
                 "./dataset/metadata", dataset_name, "full-shot.jsonl"
             )
 
-        data_path = DATA_PATH[dataset_name.split("-")[0]]
-        text_dataset = BaseDataset(data_path, meta_path, img_size, text=True)
-        image_dataset = BaseDataset(data_path, meta_path, img_size, text=False)
+        data_key = (
+            dataset_name if dataset_name in DATA_PATH else dataset_name.split("-")[0]
+        )
+        data_path = DATA_PATH[data_key]
+        text_dataset = BaseDataset(
+            data_path,
+            meta_path,
+            img_size,
+            text=True,
+            dataset_name=dataset_name,
+        )
+        image_dataset = BaseDataset(
+            data_path,
+            meta_path,
+            img_size,
+            text=False,
+            dataset_name=dataset_name,
+        )
         return text_dataset, image_dataset
     elif stage == "test":
         meta_path = os.path.join("./dataset/metadata", dataset_name, "full-shot.jsonl")
@@ -210,6 +280,7 @@ def get_dataset(
                 meta_path=meta_path,
                 img_size=img_size,
                 class_name=class_name,
+                dataset_name=dataset_name,
                 logger=logger,
             )
             datasets[class_name] = image_dataset
@@ -224,6 +295,7 @@ def get_dataset(
                 meta_path=meta_path,
                 img_size=img_size,
                 class_name=class_name,
+                dataset_name=dataset_name,
                 logger=None,
             )
             datasets[class_name] = image_dataset

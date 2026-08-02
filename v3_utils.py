@@ -93,12 +93,31 @@ def frozen_text_embedding_dict(
     }
 
 
-def binary_focal_dice_loss(logits, target, gamma=2.0, eps=1e-6):
+def _valid_sample_subset(logits, target, sample_valid):
+    if sample_valid is None:
+        return logits, target
+    valid = torch.as_tensor(sample_valid, device=logits.device, dtype=torch.bool)
+    valid = valid.reshape(-1)
+    if valid.numel() != logits.shape[0]:
+        raise ValueError("sample_valid must contain one value per batch sample")
+    return logits[valid], target[valid]
+
+
+def binary_focal_dice_loss(
+    logits,
+    target,
+    gamma=2.0,
+    eps=1e-6,
+    sample_valid=None,
+):
     if logits.shape != target.shape:
         raise ValueError(
             f"logits and target must have equal shape, got {logits.shape} and "
             f"{target.shape}"
         )
+    logits, target = _valid_sample_subset(logits, target, sample_valid)
+    if logits.shape[0] == 0:
+        return logits.sum() * 0.0
     target = target.to(dtype=logits.dtype)
     probability = torch.sigmoid(logits)
     binary_ce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
@@ -131,20 +150,50 @@ def smooth_max_pool_logits(patch_logits, temperature=10.0):
     ) / temperature
 
 
-def normal_band_consistency_loss(base_logits, perturbed_logits, mask, eps=1e-6):
+def normal_band_consistency_loss(
+    base_logits,
+    perturbed_logits,
+    mask,
+    eps=1e-6,
+    sample_valid=None,
+):
     if base_logits.shape != perturbed_logits.shape:
         raise ValueError("base and perturbed logits must have equal shape")
     patch_mask = F.adaptive_max_pool2d(mask.float(), base_logits.shape[-2:])
     normal_weight = 1.0 - patch_mask
+    if sample_valid is not None:
+        valid = torch.as_tensor(
+            sample_valid,
+            device=base_logits.device,
+            dtype=base_logits.dtype,
+        ).reshape(-1, 1, 1, 1)
+        if valid.shape[0] != base_logits.shape[0]:
+            raise ValueError("sample_valid must contain one value per batch sample")
+        normal_weight = normal_weight * valid
     difference = (torch.sigmoid(base_logits) - torch.sigmoid(perturbed_logits)).square()
     return (difference * normal_weight).sum() / normal_weight.sum().clamp_min(eps)
 
 
-def lesion_band_preservation_loss(base_logits, perturbed_logits, mask, eps=1e-6):
+def lesion_band_preservation_loss(
+    base_logits,
+    perturbed_logits,
+    mask,
+    eps=1e-6,
+    sample_valid=None,
+):
     """Prevent a frequency intervention from erasing supervised lesions."""
     if base_logits.shape != perturbed_logits.shape:
         raise ValueError("base and perturbed logits must have equal shape")
     patch_mask = F.adaptive_max_pool2d(mask.float(), base_logits.shape[-2:])
+    if sample_valid is not None:
+        valid = torch.as_tensor(
+            sample_valid,
+            device=base_logits.device,
+            dtype=base_logits.dtype,
+        ).reshape(-1, 1, 1, 1)
+        if valid.shape[0] != base_logits.shape[0]:
+            raise ValueError("sample_valid must contain one value per batch sample")
+        patch_mask = patch_mask * valid
     reference = torch.sigmoid(base_logits).detach()
     perturbed = torch.sigmoid(perturbed_logits)
     lesion_drop = F.relu(reference - perturbed)
@@ -159,33 +208,67 @@ def safe_binary_metric(metric, labels, scores):
     return float(metric(labels, scores))
 
 
-def v3_metrics(masks, labels, score_maps, image_scores, class_name):
+def v3_metrics(
+    masks,
+    labels,
+    score_maps,
+    image_scores,
+    class_name,
+    mask_valid=None,
+    has_anomaly_mask=None,
+):
     try:
         from sklearn.metrics import average_precision_score, roc_auc_score
     except ModuleNotFoundError as error:
         raise ModuleNotFoundError(
             "test_v3.py requires scikit-learn for AUC/AP metrics"
         ) from error
+    labels = np.asarray(labels).reshape(-1)
+    masks = np.asarray(masks)
+    score_maps = np.asarray(score_maps)
+    if mask_valid is None:
+        mask_valid = np.ones(labels.shape[0], dtype=bool)
+    mask_valid = np.asarray(mask_valid, dtype=bool).reshape(-1)
+    if mask_valid.shape[0] != labels.shape[0]:
+        raise ValueError("mask_valid must contain one value per evaluated image")
+    valid_masks = masks[mask_valid]
+    valid_score_maps = score_maps[mask_valid]
+
+    abnormal_count = int((labels != 0).sum())
+    if has_anomaly_mask is None:
+        masked_abnormal_count = int(((labels != 0) & mask_valid).sum())
+    else:
+        has_anomaly_mask = np.asarray(has_anomaly_mask, dtype=bool).reshape(-1)
+        if has_anomaly_mask.shape[0] != labels.shape[0]:
+            raise ValueError(
+                "has_anomaly_mask must contain one value per evaluated image"
+            )
+        masked_abnormal_count = int(((labels != 0) & has_anomaly_mask).sum())
+    mask_coverage = (
+        100.0 * masked_abnormal_count / abnormal_count
+        if abnormal_count > 0
+        else float("nan")
+    )
+
     return {
         "class name": class_name,
         "pixel AUC": 100.0
-        * safe_binary_metric(roc_auc_score, np.asarray(masks), np.asarray(score_maps)),
+        * safe_binary_metric(roc_auc_score, valid_masks, valid_score_maps),
         "pixel AP": 100.0
         * safe_binary_metric(
             average_precision_score,
-            np.asarray(masks),
-            np.asarray(score_maps),
+            valid_masks,
+            valid_score_maps,
         ),
         "image AUC": 100.0
-        * safe_binary_metric(
-            roc_auc_score, np.asarray(labels), np.asarray(image_scores)
-        ),
+        * safe_binary_metric(roc_auc_score, labels, np.asarray(image_scores)),
         "image AP": 100.0
         * safe_binary_metric(
             average_precision_score,
-            np.asarray(labels),
+            labels,
             np.asarray(image_scores),
         ),
+        "masked anomaly coverage": mask_coverage,
     }
 
 

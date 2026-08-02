@@ -262,3 +262,20 @@ python test_v3.py ^
 
 checkpoint 必须由 Brain 源域验证协议统一选择，不能分别查看 Liver、DDTI、Retina
 和 Colon 测试结果后选择不同 epoch。
+
+## 12. BMAD 混合监督 LODO
+
+V3.1 支持 BMAD 六数据集 leave-one-dataset-out。每个 Fold 完全排除一个目标数据集，
+其余五个源数据集通过 dataset-balanced sampler 联合训练。设 `mask_valid` 表示 Pixel
+标注是否可信，则 Pixel 损失与正常区域一致性只在可信样本上计算；病灶保持损失只在
+确实具有异常 Mask 的样本上计算。
+
+这是有标签源域的 domain-generalization 协议，不等同于 BMAD 原论文的无监督训练
+设置；实验表和论文正文必须单独标明 `BMAD-LODO (ours)` 协议。
+
+正常图即使没有单独 Mask 文件，也具有已知的全零异常 Mask；异常无 Mask 图的空间
+位置未知，只参加 Image BCE，不能使用全零伪 Mask。测试时所有数据集报告 Image
+AUC/AP，仅 Mask 覆盖的定位数据集报告 Pixel AUC/AP，另外输出异常 Mask 覆盖率。
+
+详细 Metadata 格式、路径配置、六折命令和防止目标域 epoch 选择泄漏的规则见
+`BMAD_LODO.md`。

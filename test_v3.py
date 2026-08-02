@@ -41,6 +41,7 @@ RESULT_FIELDS = (
     "pixel AP",
     "image AUC",
     "image AP",
+    "masked anomaly coverage",
     "test noise severity",
 )
 
@@ -136,6 +137,8 @@ def predict_class(
     labels = []
     score_maps = []
     image_scores = []
+    mask_validity = []
+    anomaly_mask_availability = []
     for input_data in tqdm(dataloader, desc="V3 inference", leave=False):
         image = input_data["image"].to(device, non_blocking=True)
         file_names = list(input_data["file_name"])
@@ -161,17 +164,29 @@ def predict_class(
         image_scores.append(torch.sigmoid(image_logits).cpu().numpy())
         masks.append(input_data["mask"].cpu().numpy())
         labels.append(input_data["label"].cpu().numpy().reshape(-1))
+        mask_validity.append(input_data["mask_valid"].cpu().numpy().reshape(-1))
+        anomaly_mask_availability.append(
+            input_data["has_anomaly_mask"].cpu().numpy().reshape(-1)
+        )
     return (
         np.concatenate(masks, axis=0),
         np.concatenate(labels, axis=0),
         np.concatenate(score_maps, axis=0),
         np.concatenate(image_scores, axis=0),
+        np.concatenate(mask_validity, axis=0),
+        np.concatenate(anomaly_mask_availability, axis=0),
     )
 
 
 def average_result(class_results):
     row = {"class name": "Average"}
-    for name in ("pixel AUC", "pixel AP", "image AUC", "image AP"):
+    for name in (
+        "pixel AUC",
+        "pixel AP",
+        "image AUC",
+        "image AP",
+        "masked anomaly coverage",
+    ):
         values = np.asarray([result[name] for result in class_results], dtype=float)
         row[name] = float(np.nanmean(values)) if not np.isnan(values).all() else np.nan
     return row
@@ -271,13 +286,34 @@ def main():
                 f"img_size mismatch for {checkpoint_path}: "
                 f"checkpoint={checkpoint.get('img_size')}, argument={args.img_size}"
             )
+        checkpoint_lodo_target = checkpoint.get("lodo_target")
+        if checkpoint_lodo_target is not None and len(checkpoint_paths) != 1:
+            raise ValueError(
+                "LODO evaluation requires exactly one fixed checkpoint; "
+                "do not select an epoch using the held-out target dataset"
+            )
+        if (
+            checkpoint_lodo_target is not None
+            and checkpoint_lodo_target != args.dataset
+        ):
+            raise ValueError(
+                f"LODO target mismatch for {checkpoint_path}: "
+                f"checkpoint={checkpoint_lodo_target}, test={args.dataset}"
+            )
         model.load_head_state_dict(checkpoint["head"], strict=True)
         model.eval()
         epoch = int(checkpoint["epoch"])
         class_results = []
         for class_name, image_dataset in image_datasets.items():
             dataloader = DataLoader(image_dataset, **dataloader_kwargs)
-            masks, labels, score_maps, image_scores = predict_class(
+            (
+                masks,
+                labels,
+                score_maps,
+                image_scores,
+                mask_valid,
+                has_anomaly_mask,
+            ) = predict_class(
                 model,
                 text_embedding_dict[class_name],
                 dataloader,
@@ -290,6 +326,8 @@ def main():
                 score_maps,
                 image_scores,
                 class_name,
+                mask_valid=mask_valid,
+                has_anomaly_mask=has_anomaly_mask,
             )
             class_results.append(result)
         class_results.append(average_result(class_results))
@@ -297,12 +335,14 @@ def main():
         logger.info("checkpoint %s (epoch %d)", checkpoint_path, epoch)
         for result in class_results:
             logger.info(
-                "%s | pixel AUC %.4f | pixel AP %.4f | image AUC %.4f | image AP %.4f",
+                "%s | pixel AUC %.4f | pixel AP %.4f | image AUC %.4f | "
+                "image AP %.4f | masked anomaly coverage %.2f%%",
                 result["class name"],
                 result["pixel AUC"],
                 result["pixel AP"],
                 result["image AUC"],
                 result["image AP"],
+                result["masked anomaly coverage"],
             )
             all_rows.append(
                 {

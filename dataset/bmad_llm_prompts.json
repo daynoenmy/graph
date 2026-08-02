@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "language": "en",
+  "generation": {
+    "method": "offline LLM-authored BMAD prompt bank",
+    "generator_record": "LLM-assisted drafting in the development session; record the exact provider and model identifier before publication",
+    "intended_use": "fixed normal/abnormal CLIP anchors for BMAD leave-one-dataset-out evaluation",
+    "constraints": [
+      "describe visible imaging appearance rather than a specific diagnosis",
+      "preserve modality and anatomy context",
+      "do not use target images, masks, or test labels to construct prompts"
+    ]
+  },
+  "datasets": {
+    "Brain": {
+      "normal": [
+        "a brain MRI scan with symmetric anatomy and no focal abnormal signal",
+        "a normal brain MRI with homogeneous tissue appearance and preserved structural boundaries",
+        "a healthy brain scan showing balanced intensity patterns across corresponding regions",
+        "a brain MRI without a localized lesion, mass effect, or irregular tissue texture",
+        "a normal medical image of the brain with continuous anatomy and expected contrast",
+        "a brain scan whose local regions are consistent with the surrounding healthy tissue"
+      ],
+      "abnormal": [
+        "a brain MRI containing a focal region with signal intensity inconsistent with nearby tissue",
+        "an abnormal brain scan with a localized lesion-like area and heterogeneous texture",
+        "a brain MRI showing asymmetric tissue appearance or an irregular focal boundary",
+        "a pathological brain image containing a suspicious region that disrupts normal anatomy",
+        "a brain scan with a localized abnormality differing in contrast from surrounding tissue",
+        "an abnormal medical image of the brain with a focal structural or intensity irregularity"
+      ]
+    },
+    "Liver": {
+      "normal": [
+        "a liver CT scan with homogeneous parenchymal attenuation and no focal lesion",
+        "a normal liver scan with smooth boundaries and consistent internal texture",
+        "a healthy liver CT image showing uniform local intensity across the parenchyma",
+        "a liver scan without a localized mass-like region or irregular attenuation",
+        "a normal medical image of the liver with preserved shape and expected contrast",
+        "a liver CT whose local regions remain consistent with surrounding healthy tissue"
+      ],
+      "abnormal": [
+        "a liver CT scan containing a focal region with attenuation different from surrounding parenchyma",
+        "an abnormal liver image with a localized lesion-like area and heterogeneous texture",
+        "a liver CT showing an irregular focal boundary or disrupted internal appearance",
+        "a pathological liver scan containing a suspicious localized region",
+        "a liver image with a focal intensity abnormality inconsistent with nearby tissue",
+        "an abnormal medical image of the liver with a mass-like or structurally irregular area"
+      ]
+    },
+    "Retina": {
+      "normal": [
+        "a normal retinal OCT image with continuous layered anatomy and no focal fluid-like region",
+        "a healthy retinal OCT scan with smooth layer boundaries and consistent reflectivity",
+        "a retinal cross-section showing preserved stratification without localized elevation or disruption",
+        "a normal OCT image with coherent retinal thickness and regular tissue texture",
+        "a retinal scan without focal dark cavities, bright deposits, or irregular layer deformation",
+        "a healthy retinal OCT whose local structures remain consistent with neighboring tissue"
+      ],
+      "abnormal": [
+        "a retinal OCT image containing a focal region that disrupts the normal layered anatomy",
+        "an abnormal retinal scan with localized fluid-like darkness or irregular reflective material",
+        "a retinal OCT showing focal elevation, deformation, or discontinuity of tissue layers",
+        "a pathological retinal cross-section containing a suspicious localized structural change",
+        "a retinal scan with a focal reflectivity pattern inconsistent with adjacent tissue",
+        "an abnormal OCT image with localized thickness, boundary, or texture irregularity"
+      ]
+    },
+    "Retina_OCT2017": {
+      "normal": [
+        "a normal retinal OCT image with continuous layered anatomy and uniform local reflectivity",
+        "a healthy OCT cross-section with smooth retinal boundaries and preserved layer organization",
+        "a retinal scan showing regular thickness without focal deposits or fluid-like spaces",
+        "a normal retinal OCT with coherent texture across neighboring tissue layers",
+        "a healthy retinal cross-section without localized elevation, deformation, or disruption",
+        "a retinal OCT whose local appearance is consistent with the surrounding anatomy"
+      ],
+      "abnormal": [
+        "an abnormal retinal OCT containing a localized disruption of normal tissue layers",
+        "a retinal cross-section with focal fluid-like darkness or irregular bright material",
+        "a retinal OCT showing an uneven layer boundary or localized structural deformation",
+        "a pathological retinal scan containing a suspicious region with abnormal reflectivity",
+        "an OCT image with focal thickness or texture inconsistent with neighboring retinal tissue",
+        "an abnormal retinal cross-section with localized deposits, cavities, or layer discontinuity"
+      ]
+    },
+    "Chest": {
+      "normal": [
+        "a normal chest X-ray with symmetric lung fields and no focal pulmonary opacity",
+        "a healthy chest radiograph with clear lungs and preserved cardiomediastinal contours",
+        "a chest X-ray showing balanced aeration without localized consolidation or irregular density",
+        "a normal radiograph with continuous rib and diaphragm boundaries and no suspicious focal region",
+        "a healthy chest image with expected bilateral structure and homogeneous lung appearance",
+        "a chest X-ray whose local densities are consistent with the surrounding anatomy"
+      ],
+      "abnormal": [
+        "a chest X-ray containing a focal opacity or density inconsistent with nearby lung tissue",
+        "an abnormal chest radiograph with asymmetric pulmonary appearance or localized structural change",
+        "a chest image showing a suspicious region that disrupts normal lung or pleural contours",
+        "a pathological chest X-ray containing an irregular focal or diffuse radiographic pattern",
+        "a chest radiograph with localized increased or decreased density relative to surrounding anatomy",
+        "an abnormal chest image with a visible structural, boundary, or intensity irregularity"
+      ]
+    },
+    "Histopathology": {
+      "normal": [
+        "a normal histopathology image with regular tissue organization and consistent cellular texture",
+        "a healthy tissue section showing coherent staining and no focal architectural disruption",
+        "a histology image with uniform local cell distribution and preserved structural patterns",
+        "a normal microscopy field without a localized cluster of irregular cells or abnormal texture",
+        "a healthy histopathology patch with consistent color, density, and tissue boundaries",
+        "a tissue image whose local morphology remains similar to neighboring regions"
+      ],
+      "abnormal": [
+        "a histopathology image containing a focal region with cellular texture different from nearby tissue",
+        "an abnormal tissue section with irregular local architecture or heterogeneous staining",
+        "a histology image showing a suspicious cluster that disrupts the surrounding organization",
+        "a pathological microscopy field containing a localized region of atypical density or morphology",
+        "a tissue image with irregular boundaries, color, or cellular arrangement in a focal area",
+        "an abnormal histopathology patch whose local structure differs from neighboring tissue"
+      ]
+    }
+  }
+}
