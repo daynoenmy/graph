@@ -91,6 +91,28 @@ The former diffusion-denoising experiment is retained for reference in
 [DENOISING.md](DENOISING.md), but its checkpoints are not consumed by the
 current ``train.py`` or ``test.py`` pipeline.
 
+### 5. V3: frozen spatial-frequency graph
+
+The independent V3 path freezes the complete CLIP image and text encoders and
+trains only a small post-encoder head. It applies a fixed stationary Haar
+transform to the frozen patch grid, builds a local spatial-frequency coherence
+graph, and learns a residual correction to the fixed normal/abnormal CLIP
+margin. V3 does not use V1 adapters, a second noisy image view, KNN graph,
+lesion/boundary losses, or a separate CLS score branch.
+
+```bash
+python train_v3.py --dataset Brain --training_mode full_shot \
+  --save_path ./ckpt/v3_frozen_sfgraph --prompt_source llm
+
+python test_v3.py --dataset Liver \
+  --save_path ./ckpt/v3_frozen_sfgraph \
+  --checkpoint 'v3_head_epoch_*.pth' --test_noise_severity 0.0
+```
+
+See [V3_METHOD.md](V3_METHOD.md) for the equations, architecture differences,
+medical interpretation, commands, and required ablations. The original V1
+entry points remain ``train.py`` and ``test.py``.
+
 For a paired medical case study against the original AA-CLIP, run:
 
 ```bash
