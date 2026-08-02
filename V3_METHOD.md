@@ -1,10 +1,15 @@
-# V3：冻结编码器空间—频率一致性图
+# V3.1：冻结编码器病灶保持空间—频率图
 
 ## 1. 方法定位
 
-V3 是与 V1 独立的实验分支。V1 通过 Text/Image Adapter、双噪声视图和病灶保持
-Patch Graph 适配 CLIP；V3 则完全冻结 CLIP 图像与文本 Encoder，只在 Encoder 输出
-之后训练一个约 2.6 万参数的空间—频率图残差头。
+V3 是与 V1 独立的实验分支，当前 checkpoint version 2 对应增强后的 V3.1。V1 通过
+Text/Image Adapter、双噪声视图和病灶保持 Patch Graph 适配 CLIP；V3.1 则完全冻结
+CLIP 图像与文本 Encoder，只在 Encoder 输出之后训练一个约 2.6 万参数的病灶保持
+空间—频率图残差头。
+
+V3.1 的中心假设不是“高频等于病灶”，而是：真实病灶更可能同时获得文本异常语义、
+邻域异常共识和结构化频率残差的支持；孤立噪声即使频率响应较高，也缺少稳定的邻域
+异常共识。
 
 当前数据是二维静态医学图像，因此论文中应称为**空间—频率变换**，不能称为
 时间—频率变换。只有使用连续超声帧、时间序列或有序体数据切片时，才存在真实的
@@ -18,6 +23,9 @@ Patch Graph 适配 CLIP；V3 则完全冻结 CLIP 图像与文本 Encoder，只�
   Encoder 内插入 Token，也不使用 SCA/SAF。
 - [FE-CLIP](https://openaccess.thecvf.com/content/ICCV2025/html/Gong_FE-CLIP_Frequency_Enhanced_CLIP_Model_for_Zero-Shot_Anomaly_Detection_and_ICCV_2025_paper.html)
   使用 DCT 频率 Adapter；V3 不修改 Encoder，而是在冻结特征之后使用固定平稳小波。
+- [DLVP-CLIP](https://openaccess.thecvf.com/content/CVPR2026/html/Zhang_DLVP-CLIP_Enhancing_Fine-Grained_Zero-Shot_Anomaly_Detection_via_Dynamic_Local_Visual_CVPR_2026_paper.html)
+  已使用小波高低频分解和动态视觉 Prompt；V3.1 不使用 Prompt Token 或 IDWT 重建，
+  核心区别是无自环邻域共识、病灶门控图、孤立伪异常证据与有界残差。
 - [Wave-MambaAD](https://openaccess.thecvf.com/content/ICCV2025/html/Zhang_Wave-MambaAD_Wavelet-driven_State_Space_Model_for_Multi-class_Unsupervised_Anomaly_Detection_ICCV_2025_paper.html)
   分别建模高低频；V3 不使用 Mamba 或重建，而是建模医学 patch 的空间—频率一致性。
 - [CLAP](https://arxiv.org/abs/2411.07546) 说明正常/异常对比有助于减少医学误报；V3
@@ -41,7 +49,8 @@ flowchart LR
     ANCHOR --> PRIOR["Patch 正常异常语义竞争"]
     PATCH --> PRIOR
     PRIOR --> GRAPH
-    GRAPH --> HEAD["轻量图残差评分头"]
+    GRAPH --> GATE["病灶共识门与孤立伪异常证据"]
+    GATE --> HEAD["有界轻量图残差评分头"]
     HEAD --> MAP["Pixel Anomaly Map"]
     MAP --> LSE["LogSumExp 图像池化"]
     LSE --> SCORE["Image Anomaly Score"]
@@ -70,8 +79,8 @@ a_i=\operatorname{Softmax}([z_{i,n},z_{i,a}])_a,
 \]
 
 所有 CLIP 参数的 `requires_grad=False`，模型处于 `eval()` 状态。checkpoint 只保存
-V3 Head，不复制 CLIP 权重。测试时会强制核对特征层、Head 维度、三个温度参数以及
-图像级池化温度，避免训练和测试配置不一致却未被发现。
+V3 Head，不复制 CLIP 权重。测试时会强制核对特征层、Head 维度、图边温度、修正
+上界以及图像级池化温度，避免训练和测试配置不一致却未被发现。
 
 ## 5. 固定空间—频率变换
 
@@ -89,7 +98,7 @@ V3 Head，不复制 CLIP 权重。测试时会强制核对特征层、Head 维�
 三个高频能量使用同一图像级尺度归一化，保留方向频带之间的相对能量，不能分别
 标准化后把频带差异抵消。
 
-## 6. 空间—频率一致性图
+## 6. 病灶保持空间—频率图
 
 每个 patch 是一个节点，只连接固定八邻域。边权同时考虑低频结构相似性和三个高频
 方向的相对能量：
@@ -100,14 +109,38 @@ w_{ij}\propto A_{ij}^{\mathrm{spatial}}
 -\frac{\lVert q_i-q_j\rVert_2^2}{\tau_H}\right),
 \]
 
-其中 \(q_i=[E_{LH,i},E_{HL,i},E_{HH,i}]\)。图邻域均值产生三类可解释量：
+其中 \(q_i=[E_{LH,i},E_{HL,i},E_{HH,i}]\)。第一阶段只使用空间—频率边权，并且
+计算邻域异常共识时排除中心节点：
 
 \[
-\bar F_i=\sum_j\widetilde w_{ij}F_j,
+c_i=\frac{\sum_{j\in\mathcal N(i)}w_{ij}a_j}
+{\sum_{j\in\mathcal N(i)}w_{ij}},
 \qquad
-\bar q_i=\sum_j\widetilde w_{ij}q_j,
+g_i=a_i c_i,
 \qquad
-\bar a_i=\sum_j\widetilde w_{ij}a_j.
+u_i=a_i(1-c_i).
+\]
+
+- \(g_i\) 是病灶保持门：节点和邻域都支持异常时才会升高；
+- \(u_i\) 是孤立异常证据：节点异常概率高、邻域却不支持时升高；
+- 排除自环可避免单个伪异常用自身异常概率制造虚假的邻域共识。
+
+第二阶段构造有向病灶保持权重：
+
+\[
+\widehat w_{ij}=w_{ij}
+\left[(1-g_i)+g_i
+\exp\left(-\frac{(a_i-a_j)^2}{\tau_A}\right)\right].
+\]
+
+只有得到邻域支持的病灶节点才抑制跨语义消息；孤立异常保持较低的 \(g_i\)，继续从
+结构相容的正常邻居获得修正。这比直接依据节点异常概率切断边更不容易保留噪声
+伪阳性。归一化后的图邻域均值为：
+
+\[
+\bar F_i=\sum_j\widetilde{\widehat w}_{ij}F_j,
+\qquad
+\bar q_i=\sum_j\widetilde{\widehat w}_{ij}q_j.
 \]
 
 语义和频率残差为：
@@ -118,21 +151,25 @@ r_i^s=1-\cos(F_i,\bar F_i),
 r_i^f=\lVert q_i-\bar q_i\rVert_2.
 \]
 
-随机高频噪声可能有较高 \(r_i^f\)，但通常缺乏稳定文本异常先验和邻域异常一致性；
-真实病灶更可能同时具有较高 \(a_i\)、\(\bar a_i\) 和结构化空间—频率残差。这是待
-实验验证的医学成像假设，不是对任意噪声的理论保证。
+随机高频噪声可能有较高 \(r_i^f\) 和 \(u_i\)，但通常缺乏较高 \(g_i\)；真实病灶
+更可能同时具有较高 \(a_i\)、\(c_i\)、\(g_i\) 和结构化空间—频率残差。这是待实验
+验证的医学成像假设，不是对任意噪声的无条件保证。
 
-## 7. 轻量残差评分头
+## 7. 有界轻量残差评分头
 
 评分头只学习对冻结 CLIP margin 的修正：
 
 \[
-s_i=m_i+H_\theta
-\left(F_i-\bar F_i,a_i,\bar a_i,r_i^s,r_i^f,E_{LL,i},E_{HF,i}\right).
+s_i=m_i+\Delta_i,
+\qquad
+\Delta_i=C\tanh\left(\frac{H_\theta(z_i)}{C}\right),
 \]
 
-最后一层初始化为零，因此训练开始时 V3 严格等于冻结 CLIP 的正常/异常文本 margin，
-随后只学习图和频率残差修正。默认 `hidden_dim=32` 时，Head 约有 2.6 万参数。
+其中 \(z_i\) 包含语义概率、邻域共识、病灶门、孤立异常证据以及语义/频率残差。
+最后一层初始化为零，因此训练开始时 V3.1 严格等于冻结 CLIP 的正常/异常文本
+margin。默认 `C=4`，始终满足 \(|s_i-m_i|\leq4\)；当 \(|m_i|>4\) 时，残差 Head
+不能翻转冻结语义判断的符号。这是一条可验证的有界修正性质，不是准确率保证。
+默认 `hidden_dim=32` 时，Head 约有 2.6 万参数。
 
 图像分数完全来自同一张异常图：
 
@@ -150,12 +187,18 @@ V3 不再额外使用 CLS 分支，避免 Pixel 与 Image 预测来自不同证�
 \mathcal L
 =\mathcal L_{\mathrm{focal+dice}}
 +\lambda_I\mathcal L_{\mathrm{image}}
-+\lambda_F\mathcal L_{\mathrm{band}}.
++\lambda_N\mathcal L_{\mathrm{normal-band}}
++\lambda_L\mathcal L_{\mathrm{lesion-preserve}}.
 \]
 
-`band consistency` 在冻结 Encoder 只运行一次的前提下，随机衰减一个高频方向，并在
-正常 patch 上约束预测稳定。它只重新运行约 2.6 万参数的 Head，不生成第二张图，也
-不再次运行 CLIP Encoder。
+频带干预在冻结 Encoder 只运行一次的前提下，把随机高频方向缩放到默认 `[0.5,1.5]`
+范围：小于 1 模拟细节衰减/模糊，大于 1 模拟高频噪声增强。正常 Patch 使用双向一致
+性约束；病灶 Patch 使用单边保持损失，只惩罚干预后病灶概率下降，避免通过压低病灶
+响应获得表面稳定性。两条分支只重新运行约 2.6 万参数的 Head，不生成第二张图，也不
+再次运行 CLIP Encoder。
+
+V3.1 checkpoint `version=2`。由于图输入维数与推理约束已经变化，早期 V3
+`version=1` checkpoint 不能直接加载，必须重新训练。
 
 ## 9. 与 V1 的代码隔离
 
@@ -181,7 +224,7 @@ train_v3.bat
 默认使用 Brain full-shot，保存到：
 
 ```text
-ckpt/v3_frozen_sfgraph
+ckpt/v3_lesion_sfgraph
 ```
 
 测试所有 epoch：
@@ -195,7 +238,7 @@ test_v3.bat
 ```bat
 python test_v3.py ^
   --dataset Liver ^
-  --save_path ./ckpt/v3_frozen_sfgraph ^
+  --save_path ./ckpt/v3_lesion_sfgraph ^
   --checkpoint v3_head_epoch_*.pth ^
   --test_noise_severity 0.06
 ```
@@ -209,10 +252,13 @@ python test_v3.py ^
 2. + Spatial Graph；
 3. + SWT Frequency Descriptor；
 4. + Spatial–Frequency Edge；
-5. + Band Consistency；
-6. Template Prompt 与 LLM Prompt；
-7. 第 12、18、24 层特征；
-8. V1 与 V3 的参数量、显存、训练稳定性和跨域性能。
+5. + Lesion-Preservation Gate；
+6. + Bounded Correction；
+7. + 双向 Band Consistency；
+8. + Lesion Preservation Loss；
+9. Template Prompt 与 LLM Prompt；
+10. 第 12、18、24 层特征；
+11. V1、原始 V3 与 V3.1 的参数量、显存、稳定性和跨域性能。
 
 checkpoint 必须由 Brain 源域验证协议统一选择，不能分别查看 Liver、DDTI、Retina
 和 Colon 测试结果后选择不同 epoch。

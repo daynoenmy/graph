@@ -140,6 +140,17 @@ def normal_band_consistency_loss(base_logits, perturbed_logits, mask, eps=1e-6):
     return (difference * normal_weight).sum() / normal_weight.sum().clamp_min(eps)
 
 
+def lesion_band_preservation_loss(base_logits, perturbed_logits, mask, eps=1e-6):
+    """Prevent a frequency intervention from erasing supervised lesions."""
+    if base_logits.shape != perturbed_logits.shape:
+        raise ValueError("base and perturbed logits must have equal shape")
+    patch_mask = F.adaptive_max_pool2d(mask.float(), base_logits.shape[-2:])
+    reference = torch.sigmoid(base_logits).detach()
+    perturbed = torch.sigmoid(perturbed_logits)
+    lesion_drop = F.relu(reference - perturbed)
+    return (lesion_drop * patch_mask).sum() / patch_mask.sum().clamp_min(eps)
+
+
 def safe_binary_metric(metric, labels, scores):
     labels = np.asarray(labels).reshape(-1)
     scores = np.asarray(scores).reshape(-1)
@@ -213,6 +224,10 @@ def validate_v3_checkpoint(checkpoint, expected_config):
         raise ValueError("checkpoint is not a frozen_sfgraph_v3 checkpoint")
     if checkpoint.get("encoder_frozen") is not True:
         raise ValueError("V3 checkpoint does not declare a frozen encoder")
+    if checkpoint.get("version") != 2:
+        raise ValueError(
+            "checkpoint is not compatible with the lesion-preserving V3.1 head"
+        )
     actual_config = checkpoint.get("architecture")
     if not isinstance(actual_config, dict):
         raise ValueError("V3 checkpoint has no architecture metadata")

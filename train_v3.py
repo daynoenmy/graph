@@ -1,4 +1,4 @@
-"""Train V3: a frozen CLIP encoder with a spatial-frequency graph head."""
+"""Train V3.1: a frozen CLIP encoder with a lesion-preserving SF graph."""
 
 import argparse
 import logging
@@ -24,6 +24,7 @@ from utils import setup_seed
 from v3_utils import (
     binary_focal_dice_loss,
     frozen_text_embedding_dict,
+    lesion_band_preservation_loss,
     normal_band_consistency_loss,
     smooth_max_pool_logits,
     validate_v3_checkpoint,
@@ -32,7 +33,7 @@ from v3_utils import (
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Train the frozen-encoder V3 spatial-frequency graph head"
+        description="Train the frozen-encoder V3.1 lesion-preserving graph head"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -49,7 +50,7 @@ def build_parser():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=111)
-    parser.add_argument("--save_path", type=str, default="ckpt/v3_frozen_sfgraph")
+    parser.add_argument("--save_path", type=str, default="ckpt/v3_lesion_sfgraph")
     parser.add_argument(
         "--resume_checkpoint",
         type=str,
@@ -62,11 +63,14 @@ def build_parser():
     parser.add_argument("--text_temperature", type=float, default=10.0)
     parser.add_argument("--low_frequency_temperature", type=float, default=0.2)
     parser.add_argument("--high_frequency_temperature", type=float, default=1.0)
+    parser.add_argument("--semantic_graph_temperature", type=float, default=0.1)
+    parser.add_argument("--max_correction", type=float, default=4.0)
     parser.add_argument("--image_pool_temperature", type=float, default=10.0)
     parser.add_argument("--image_loss_weight", type=float, default=1.0)
     parser.add_argument("--band_consistency_weight", type=float, default=0.05)
-    parser.add_argument("--band_attenuation_min", type=float, default=0.2)
-    parser.add_argument("--band_attenuation_max", type=float, default=0.8)
+    parser.add_argument("--lesion_preservation_weight", type=float, default=0.05)
+    parser.add_argument("--band_scale_min", type=float, default=0.5)
+    parser.add_argument("--band_scale_max", type=float, default=1.5)
 
     parser.add_argument(
         "--prompt_source",
@@ -94,14 +98,23 @@ def validate_args(parser, args):
         "text_temperature",
         "low_frequency_temperature",
         "high_frequency_temperature",
+        "semantic_graph_temperature",
+        "max_correction",
         "image_pool_temperature",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"{name} must be positive")
-    if args.image_loss_weight < 0 or args.band_consistency_weight < 0:
+    if (
+        min(
+            args.image_loss_weight,
+            args.band_consistency_weight,
+            args.lesion_preservation_weight,
+        )
+        < 0
+    ):
         parser.error("loss weights must be non-negative")
-    if not 0 <= args.band_attenuation_min <= args.band_attenuation_max <= 1:
-        parser.error("band attenuation range must lie in [0, 1]")
+    if not 0 <= args.band_scale_min < 1 < args.band_scale_max <= 2:
+        parser.error("band scale range must satisfy 0 <= min < 1 < max <= 2")
     if args.training_mode == "few_shot" and args.shot < 1:
         parser.error("shot must be positive in few_shot mode")
 
@@ -145,7 +158,7 @@ def checkpoint_payload(
     architecture["image_pool_temperature"] = float(args.image_pool_temperature)
     return {
         "method": "frozen_sfgraph_v3",
-        "version": 1,
+        "version": 2,
         "epoch": epoch,
         "encoder_frozen": True,
         "model_name": args.model_name,
@@ -187,6 +200,8 @@ def main():
         text_temperature=args.text_temperature,
         low_frequency_temperature=args.low_frequency_temperature,
         high_frequency_temperature=args.high_frequency_temperature,
+        semantic_graph_temperature=args.semantic_graph_temperature,
+        max_correction=args.max_correction,
     ).to(device)
     if any(parameter.requires_grad for parameter in model.clip_model.parameters()):
         raise RuntimeError("V3 invariant violated: CLIP encoder is not fully frozen")
@@ -268,7 +283,8 @@ def main():
         pixel_losses = []
         image_losses = []
         consistency_losses = []
-        progress = tqdm(dataloader, desc=f"V3 epoch {epoch + 1}/{args.epochs}")
+        lesion_preservation_losses = []
+        progress = tqdm(dataloader, desc=f"V3.1 epoch {epoch + 1}/{args.epochs}")
         for input_data in progress:
             image = input_data["image"].to(device, non_blocking=True)
             mask = input_data["mask"].to(device, non_blocking=True).float()
@@ -284,9 +300,9 @@ def main():
                 image,
                 batch_text,
                 return_band_perturbation=True,
-                band_attenuation_range=(
-                    args.band_attenuation_min,
-                    args.band_attenuation_max,
+                band_scale_range=(
+                    args.band_scale_min,
+                    args.band_scale_max,
                 ),
             )
             base_logits = base_output
@@ -307,8 +323,14 @@ def main():
                 perturbed_logits,
                 mask,
             )
+            lesion_preservation_loss = lesion_band_preservation_loss(
+                base_logits,
+                perturbed_logits,
+                mask,
+            )
             loss = pixel_loss + args.image_loss_weight * image_loss
             loss = loss + args.band_consistency_weight * consistency_loss
+            loss = loss + args.lesion_preservation_weight * lesion_preservation_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=5.0)
             optimizer.step()
@@ -317,15 +339,18 @@ def main():
             pixel_losses.append(float(pixel_loss.detach()))
             image_losses.append(float(image_loss.detach()))
             consistency_losses.append(float(consistency_loss.detach()))
+            lesion_preservation_losses.append(float(lesion_preservation_loss.detach()))
             progress.set_postfix(loss=f"{losses[-1]:.4f}")
 
         logger.info(
-            "epoch %d | loss %.6f | pixel %.6f | image %.6f | band %.6f",
+            "epoch %d | loss %.6f | pixel %.6f | image %.6f | "
+            "normal-band %.6f | lesion-preserve %.6f",
             epoch + 1,
             np.mean(losses),
             np.mean(pixel_losses),
             np.mean(image_losses),
             np.mean(consistency_losses),
+            np.mean(lesion_preservation_losses),
         )
         payload = checkpoint_payload(
             model,

@@ -101,6 +101,8 @@ class SpatialFrequencyCoherenceHead(nn.Module):
         text_temperature=10.0,
         low_frequency_temperature=0.2,
         high_frequency_temperature=1.0,
+        semantic_graph_temperature=0.1,
+        max_correction=4.0,
     ):
         super().__init__()
         if embedding_dim < 1 or hidden_dim < 1:
@@ -110,16 +112,20 @@ class SpatialFrequencyCoherenceHead(nn.Module):
                 text_temperature,
                 low_frequency_temperature,
                 high_frequency_temperature,
+                semantic_graph_temperature,
+                max_correction,
             )
             <= 0
         ):
-            raise ValueError("all temperatures must be positive")
+            raise ValueError("temperatures and max_correction must be positive")
 
         self.embedding_dim = int(embedding_dim)
         self.hidden_dim = int(hidden_dim)
         self.text_temperature = float(text_temperature)
         self.low_frequency_temperature = float(low_frequency_temperature)
         self.high_frequency_temperature = float(high_frequency_temperature)
+        self.semantic_graph_temperature = float(semantic_graph_temperature)
+        self.max_correction = float(max_correction)
         self.wavelet = StationaryHaarWavelet()
 
         self.residual_projection = nn.Sequential(
@@ -128,7 +134,7 @@ class SpatialFrequencyCoherenceHead(nn.Module):
             nn.GELU(),
         )
         self.correction_head = nn.Sequential(
-            nn.Linear(self.hidden_dim + 6, self.hidden_dim),
+            nn.Linear(self.hidden_dim + 8, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, 1),
         )
@@ -176,7 +182,7 @@ class SpatialFrequencyCoherenceHead(nn.Module):
             patch_features.shape[0],
         ):
             raise ValueError("band_scales must have shape [3] or [B, 3]")
-        return scales.clamp(0.0, 1.0)
+        return scales.clamp(0.0, 2.0)
 
     def _semantic_margin(self, patch_features, text_embeddings):
         normalized_features = F.normalize(patch_features, dim=-1)
@@ -198,17 +204,9 @@ class SpatialFrequencyCoherenceHead(nn.Module):
         frequency_descriptor,
         anomaly_probability,
     ):
-        semantic_sum = semantic_grid.clone()
-        frequency_sum = frequency_descriptor.clone()
-        anomaly_sum = anomaly_probability.clone()
-        weight_sum = semantic_grid.new_ones(
-            (
-                semantic_grid.shape[0],
-                1,
-                semantic_grid.shape[-2],
-                semantic_grid.shape[-1],
-            )
-        )
+        neighbor_records = []
+        neighbor_anomaly_sum = torch.zeros_like(anomaly_probability)
+        neighbor_weight_sum = torch.zeros_like(anomaly_probability)
 
         for row_offset, col_offset in _SPATIAL_OFFSETS:
             neighbor_semantic, valid = _shift_to_neighbor(
@@ -240,7 +238,7 @@ class SpatialFrequencyCoherenceHead(nn.Module):
                 .square()
                 .mean(dim=1, keepdim=True)
             )
-            weight = (
+            spatial_frequency_weight = (
                 torch.exp(
                     -low_distance / self.low_frequency_temperature
                     - frequency_distance / self.high_frequency_temperature
@@ -248,15 +246,64 @@ class SpatialFrequencyCoherenceHead(nn.Module):
                 * valid
             )
 
+            neighbor_anomaly_sum = (
+                neighbor_anomaly_sum + spatial_frequency_weight * neighbor_anomaly
+            )
+            neighbor_weight_sum = neighbor_weight_sum + spatial_frequency_weight
+            neighbor_records.append(
+                (
+                    neighbor_semantic,
+                    neighbor_frequency,
+                    neighbor_anomaly,
+                    spatial_frequency_weight,
+                )
+            )
+
+        # The consensus excludes the center patch. A false isolated anomaly
+        # therefore cannot create its own lesion support through a self-loop.
+        neighbor_anomaly_consensus = (
+            neighbor_anomaly_sum / neighbor_weight_sum.clamp_min(1e-8)
+        )
+        lesion_preservation_gate = (
+            anomaly_probability * neighbor_anomaly_consensus
+        ).clamp(0.0, 1.0)
+        isolated_anomaly_evidence = (
+            anomaly_probability * (1.0 - neighbor_anomaly_consensus)
+        ).clamp(0.0, 1.0)
+
+        semantic_sum = semantic_grid.clone()
+        frequency_sum = frequency_descriptor.clone()
+        weight_sum = torch.ones_like(anomaly_probability)
+        for (
+            neighbor_semantic,
+            neighbor_frequency,
+            neighbor_anomaly,
+            spatial_frequency_weight,
+        ) in neighbor_records:
+            semantic_affinity = torch.exp(
+                -(anomaly_probability - neighbor_anomaly).square()
+                / self.semantic_graph_temperature
+            )
+            # This directed gate only suppresses cross-semantic messages when
+            # the center patch is supported as a lesion by its neighborhood.
+            # Isolated high-frequency responses keep receiving correction from
+            # their structurally compatible neighbors.
+            preservation_factor = (
+                1.0
+                - lesion_preservation_gate
+                + lesion_preservation_gate * semantic_affinity
+            )
+            weight = spatial_frequency_weight * preservation_factor
             semantic_sum = semantic_sum + weight * neighbor_semantic
             frequency_sum = frequency_sum + weight * neighbor_frequency
-            anomaly_sum = anomaly_sum + weight * neighbor_anomaly
             weight_sum = weight_sum + weight
 
         return (
             semantic_sum / weight_sum,
             frequency_sum / weight_sum,
-            anomaly_sum / weight_sum,
+            neighbor_anomaly_consensus,
+            lesion_preservation_gate,
+            isolated_anomaly_evidence,
         )
 
     def forward(
@@ -305,11 +352,17 @@ class SpatialFrequencyCoherenceHead(nn.Module):
         high_energy = high_bands.square().mean(dim=2).add(1e-8).sqrt()
         # A shared scale across all three directional bands preserves their
         # relative energy. Per-band standardization would cancel the training
-        # intervention that attenuates one selected high-frequency band.
+        # intervention that rescales one selected high-frequency band.
         frequency_descriptor = _relative_log_energy(high_energy)
         standardized_low_energy = _standardize_spatial(torch.log1p(low_energy))
 
-        graph_semantic, graph_frequency, graph_anomaly = self._graph_aggregate(
+        (
+            graph_semantic,
+            graph_frequency,
+            graph_anomaly,
+            lesion_preservation_gate,
+            isolated_anomaly_evidence,
+        ) = self._graph_aggregate(
             semantic_grid,
             low_grid,
             frequency_descriptor,
@@ -334,6 +387,8 @@ class SpatialFrequencyCoherenceHead(nn.Module):
             [
                 anomaly_grid,
                 graph_anomaly,
+                lesion_preservation_gate,
+                isolated_anomaly_evidence,
                 semantic_residual,
                 frequency_residual,
                 standardized_low_energy,
@@ -345,7 +400,10 @@ class SpatialFrequencyCoherenceHead(nn.Module):
             [projected_residual, scalar_features],
             dim=1,
         ).permute(0, 2, 3, 1)
-        correction = self.correction_head(correction_input).permute(0, 3, 1, 2)
+        raw_correction = self.correction_head(correction_input).permute(0, 3, 1, 2)
+        correction = self.max_correction * torch.tanh(
+            raw_correction / self.max_correction
+        )
         logits = margin_grid + correction
 
         if not return_aux:
@@ -354,6 +412,8 @@ class SpatialFrequencyCoherenceHead(nn.Module):
             "semantic_margin": margin_grid,
             "semantic_probability": anomaly_grid,
             "neighbor_anomaly": graph_anomaly,
+            "lesion_preservation_gate": lesion_preservation_gate,
+            "isolated_anomaly_evidence": isolated_anomaly_evidence,
             "semantic_residual": semantic_residual,
             "frequency_residual": frequency_residual,
             "low_frequency_energy": standardized_low_energy,
@@ -373,6 +433,8 @@ class FrozenSFGraphModel(nn.Module):
         text_temperature=10.0,
         low_frequency_temperature=0.2,
         high_frequency_temperature=1.0,
+        semantic_graph_temperature=0.1,
+        max_correction=4.0,
     ):
         super().__init__()
         if feature_layer < 1:
@@ -392,6 +454,8 @@ class FrozenSFGraphModel(nn.Module):
             text_temperature=text_temperature,
             low_frequency_temperature=low_frequency_temperature,
             high_frequency_temperature=high_frequency_temperature,
+            semantic_graph_temperature=semantic_graph_temperature,
+            max_correction=max_correction,
         )
         for parameter in self.clip_model.parameters():
             parameter.requires_grad = False
@@ -427,7 +491,7 @@ class FrozenSFGraphModel(nn.Module):
         band_scales=None,
         return_aux=False,
         return_band_perturbation=False,
-        band_attenuation_range=(0.2, 0.8),
+        band_scale_range=(0.5, 1.5),
     ):
         patch_features = self.encode_patches(image)
         output = self.head(
@@ -439,15 +503,13 @@ class FrozenSFGraphModel(nn.Module):
         if not return_band_perturbation:
             return output
 
-        minimum, maximum = band_attenuation_range
-        if not 0.0 <= minimum <= maximum <= 1.0:
-            raise ValueError("band attenuation range must lie in [0, 1]")
+        minimum, maximum = band_scale_range
+        if not 0.0 <= minimum <= maximum <= 2.0:
+            raise ValueError("band scale range must lie in [0, 2]")
         band_index = int(torch.randint(0, 3, (), device=image.device))
-        attenuation = float(
-            torch.empty((), device=image.device).uniform_(minimum, maximum)
-        )
+        scale = float(torch.empty((), device=image.device).uniform_(minimum, maximum))
         scales = patch_features.new_ones(3)
-        scales[band_index] = attenuation
+        scales[band_index] = scale
         perturbed_logits = self.head(
             patch_features,
             text_embeddings,
@@ -459,7 +521,7 @@ class FrozenSFGraphModel(nn.Module):
             perturbed_logits,
             {
                 "band_index": band_index,
-                "band_attenuation": attenuation,
+                "band_scale": scale,
                 "base_logits": base_logits,
             },
         )
@@ -481,5 +543,7 @@ class FrozenSFGraphModel(nn.Module):
             "text_temperature": self.head.text_temperature,
             "low_frequency_temperature": self.head.low_frequency_temperature,
             "high_frequency_temperature": self.head.high_frequency_temperature,
+            "semantic_graph_temperature": self.head.semantic_graph_temperature,
+            "max_correction": self.head.max_correction,
             "encoder_frozen": True,
         }

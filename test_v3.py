@@ -1,4 +1,4 @@
-"""Evaluate every selected V3 frozen spatial-frequency graph checkpoint."""
+"""Evaluate every selected V3.1 lesion-preserving graph checkpoint."""
 
 import argparse
 import csv
@@ -47,7 +47,7 @@ RESULT_FIELDS = (
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Test the frozen-encoder V3 spatial-frequency graph head"
+        description="Test the frozen-encoder V3.1 lesion-preserving graph head"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -55,7 +55,7 @@ def build_parser():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=111)
-    parser.add_argument("--save_path", type=str, default="ckpt/v3_frozen_sfgraph")
+    parser.add_argument("--save_path", type=str, default="ckpt/v3_lesion_sfgraph")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -70,6 +70,8 @@ def build_parser():
     parser.add_argument("--text_temperature", type=float, default=10.0)
     parser.add_argument("--low_frequency_temperature", type=float, default=0.2)
     parser.add_argument("--high_frequency_temperature", type=float, default=1.0)
+    parser.add_argument("--semantic_graph_temperature", type=float, default=0.1)
+    parser.add_argument("--max_correction", type=float, default=4.0)
     parser.add_argument("--image_pool_temperature", type=float, default=10.0)
     parser.add_argument(
         "--prompt_source",
@@ -95,6 +97,8 @@ def validate_args(parser, args):
         "text_temperature",
         "low_frequency_temperature",
         "high_frequency_temperature",
+        "semantic_graph_temperature",
+        "max_correction",
         "image_pool_temperature",
     ):
         if getattr(args, name) <= 0:
@@ -218,6 +222,8 @@ def main():
         text_temperature=args.text_temperature,
         low_frequency_temperature=args.low_frequency_temperature,
         high_frequency_temperature=args.high_frequency_temperature,
+        semantic_graph_temperature=args.semantic_graph_temperature,
+        max_correction=args.max_correction,
     ).to(device)
     model.eval()
     expected_architecture = model.architecture_config()

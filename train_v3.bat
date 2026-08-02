@@ -4,7 +4,7 @@ cd /d "%~dp0"
 python train_v3.py ^
   --dataset Brain ^
   --training_mode full_shot ^
-  --save_path ./ckpt/v3_frozen_sfgraph ^
+  --save_path ./ckpt/v3_lesion_sfgraph ^
   --prompt_source llm ^
   --llm_prompt_path ./dataset/llm_prompts.json ^
   --feature_layer 18 ^
@@ -12,8 +12,13 @@ python train_v3.py ^
   --text_temperature 10.0 ^
   --low_frequency_temperature 0.2 ^
   --high_frequency_temperature 1.0 ^
+  --semantic_graph_temperature 0.1 ^
+  --max_correction 4.0 ^
   --image_pool_temperature 10.0 ^
   --band_consistency_weight 0.05 ^
+  --lesion_preservation_weight 0.05 ^
+  --band_scale_min 0.5 ^
+  --band_scale_max 1.5 ^
   --epochs 10
 
 if errorlevel 1 exit /b 1
