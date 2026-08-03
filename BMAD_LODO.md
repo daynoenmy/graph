@@ -21,24 +21,25 @@
 
 ## 数据路径
 
-路径统一在 `dataset/constants.py` 中注册。可以设置总目录：
+六个 BMAD 数据集的根目录固定写在 `dataset/constants.py`：
 
-```bat
-set BMAD_DATA_PATH=D:\dataset\BMAD
+```python
+BMAD_BASE_PATH = r"E:\datasets\bmad\BMAD"
 ```
 
-也可以为每个数据集单独设置：
+代码自动拼接以下目录：
 
-```bat
-set BRAIN_DATA_PATH=D:\dataset\BMAD\Brain
-set LIVER_DATA_PATH=D:\dataset\BMAD\Liver
-set RETINA_RESC_DATA_PATH=D:\dataset\BMAD\Retina_RESC
-set CHEST_DATA_PATH=D:\dataset\BMAD\Chest
-set OCT2017_DATA_PATH=D:\dataset\BMAD\Retina_OCT2017
-set HISTOPATHOLOGY_DATA_PATH=D:\dataset\BMAD\Histopathology
+```text
+E:\datasets\bmad\BMAD\Brain
+E:\datasets\bmad\BMAD\Liver
+E:\datasets\bmad\BMAD\Retina_RESC
+E:\datasets\bmad\BMAD\Chest
+E:\datasets\bmad\BMAD\Retina_OCT2017
+E:\datasets\bmad\BMAD\Histopathology
 ```
 
-单独设置的变量优先于 `BMAD_DATA_PATH` 的默认拼接路径。
+不再需要设置 `BMAD_DATA_PATH`、`BRAIN_DATA_PATH` 等环境变量。以后更换机器时，只需
+修改 `BMAD_BASE_PATH` 一处。
 
 ## Metadata 格式
 
