@@ -95,19 +95,24 @@ current ``train.py`` or ``test.py`` pipeline.
 
 The independent V3 path freezes the complete CLIP image and text encoders and
 trains only a small post-encoder head. It applies a fixed stationary Haar
-transform to the frozen patch grid, builds a local spatial-frequency coherence
-graph, and uses neighbor consensus to distinguish supported lesions from
-isolated pseudo-anomalies. Its bounded residual head corrects the fixed
-normal/abnormal CLIP margin without unrestricted semantic drift. V3 does not
-use V1 adapters, a second noisy image view, KNN graph,
-the V1 boundary-contrast loss, or a separate CLS score branch.
+transform independently to frozen layer 6/12/18/24 patch grids, applies one
+shared local spatial-frequency coherence graph head, and fuses the four layer
+probabilities with learned non-negative weights. Neighbor consensus distinguishes
+supported lesions from isolated pseudo-anomalies. Its bounded residual head
+corrects the fixed normal/abnormal CLIP margin without unrestricted semantic
+drift. Image scoring combines focal Top-k evidence, diffuse GeM evidence, and
+the frozen final CLIP CLS global evidence; the CLS path does not alter the pixel
+map. V3 does not use V1 adapters, a second noisy image view, KNN graph, or the
+V1 boundary-contrast loss.
 
 ```bash
 python train_v3.py --dataset Brain --training_mode full_shot \
-  --save_path ./ckpt/v3_lesion_sfgraph --prompt_source llm
+  --feature_layers 6 12 18 24 \
+  --save_path ./ckpt/v3_multilayer_sfgraph --prompt_source llm
 
 python test_v3.py --dataset Liver \
-  --save_path ./ckpt/v3_lesion_sfgraph \
+  --feature_layers 6 12 18 24 \
+  --save_path ./ckpt/v3_multilayer_sfgraph \
   --checkpoint 'v3_head_epoch_*.pth' --test_noise_severity 0.0
 ```
 
@@ -125,6 +130,26 @@ test_v3_lodo.bat Chest
 
 See [BMAD_LODO.md](BMAD_LODO.md) for dataset paths, optional-mask JSONL schema,
 the six folds, loss routing, metric rules, and target-domain leakage controls.
+
+### 6. V4: modality-conditioned multi-layer graph spectra
+
+V4 is an independent simplification branch. It keeps frozen CLIP layers
+6/12/18/24, constructs the fixed four-neighbor Laplacian bases
+`margin`, `L margin`, and `L^2 margin`, and uses one text-conditioned linear
+generator to assign the joint 4-by-3 spectral weights. The final CLS/local
+readout is fixed. V4 trains only 9,228 parameters for ViT-L/14 and uses Image
+BCE plus valid-mask Pixel Focal/Dice; it does not use the V3 Haar, graph head,
+lesion gate, band intervention, Top-k, or GeM modules.
+
+```bat
+train_v4_lodo.bat Chest
+test_v4_lodo.bat Chest
+```
+
+See [V4_METHOD.md](V4_METHOD.md) for the exact Laplacian, fusion equation,
+mixed-supervision routing, and checkpoint contract. V4 checkpoints are stored
+under `ckpt/v4_graph_spectral` or `ckpt/v4_bmad_lodo/<TARGET>` and cannot be
+loaded by V3.
 
 For a paired medical case study against the original AA-CLIP, run:
 

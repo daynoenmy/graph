@@ -1,7 +1,6 @@
 """Utilities shared by the frozen-encoder V3 training and evaluation paths."""
 
 import hashlib
-import math
 import re
 
 import numpy as np
@@ -139,15 +138,6 @@ def binary_focal_dice_loss(
     )
     dice = 1.0 - 0.5 * (lesion_dice + normal_dice).mean()
     return focal + dice
-
-
-def smooth_max_pool_logits(patch_logits, temperature=10.0):
-    if temperature <= 0:
-        raise ValueError("pooling temperature must be positive")
-    flat = patch_logits.flatten(start_dim=1)
-    return (
-        torch.logsumexp(flat * temperature, dim=1) - math.log(flat.shape[1])
-    ) / temperature
 
 
 def normal_band_consistency_loss(
@@ -307,10 +297,8 @@ def validate_v3_checkpoint(checkpoint, expected_config):
         raise ValueError("checkpoint is not a frozen_sfgraph_v3 checkpoint")
     if checkpoint.get("encoder_frozen") is not True:
         raise ValueError("V3 checkpoint does not declare a frozen encoder")
-    if checkpoint.get("version") != 2:
-        raise ValueError(
-            "checkpoint is not compatible with the lesion-preserving V3.1 head"
-        )
+    if checkpoint.get("version") != 3:
+        raise ValueError("checkpoint is not compatible with the multi-layer V3.1 model")
     actual_config = checkpoint.get("architecture")
     if not isinstance(actual_config, dict):
         raise ValueError("V3 checkpoint has no architecture metadata")

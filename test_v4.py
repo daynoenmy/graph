@@ -1,4 +1,4 @@
-"""Evaluate every selected V3.1 lesion-preserving graph checkpoint."""
+"""Evaluate V4 modality-conditioned graph spectral checkpoints."""
 
 import argparse
 import csv
@@ -15,19 +15,19 @@ from tqdm import tqdm
 
 from dataset import get_dataset
 from model.clip import create_model
-from model.frozen_sfgraph import FrozenSFGraphModel
+from model.modality_graph_spectral import FrozenModalityGraphSpectralModel
 from prompt_utils import (
     DEFAULT_LLM_PROMPT_PATH,
     PROMPT_SOURCES,
     validate_checkpoint_prompt_metadata,
 )
 from utils import setup_seed
-from v3_utils import (
+from v4_utils import (
     checkpoint_sort_key,
     deterministic_test_noise,
     frozen_text_embedding_dict,
-    v3_metrics,
-    validate_v3_checkpoint,
+    medical_metrics,
+    validate_v4_checkpoint,
 )
 
 
@@ -47,7 +47,7 @@ RESULT_FIELDS = (
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Test the frozen-encoder V3.1 lesion-preserving graph head"
+        description="Test V4 modality-conditioned graph spectral fusion"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -55,14 +55,14 @@ def build_parser():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=111)
-    parser.add_argument("--save_path", type=str, default="ckpt/v3_multilayer_sfgraph")
+    parser.add_argument("--save_path", type=str, default="ckpt/v4_graph_spectral")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="v3_head_epoch_*.pth",
+        default="v4_head_epoch_*.pth",
         help="checkpoint file name or glob pattern relative to save_path",
     )
-    parser.add_argument("--results_file", type=str, default="v3_results.csv")
+    parser.add_argument("--results_file", type=str, default="v4_results.csv")
     parser.add_argument("--test_noise_severity", type=float, default=0.0)
 
     parser.add_argument(
@@ -70,18 +70,11 @@ def build_parser():
         type=int,
         nargs="+",
         default=[6, 12, 18, 24],
-        help="strictly increasing frozen CLIP layers fused in probability space",
     )
-    parser.add_argument("--hidden_dim", type=int, default=32)
     parser.add_argument("--text_temperature", type=float, default=10.0)
-    parser.add_argument("--low_frequency_temperature", type=float, default=0.2)
-    parser.add_argument("--high_frequency_temperature", type=float, default=1.0)
-    parser.add_argument("--semantic_graph_temperature", type=float, default=0.1)
-    parser.add_argument("--max_correction", type=float, default=4.0)
-    parser.add_argument("--topk_ratio", type=float, default=0.05)
-    parser.add_argument("--gem_power", type=float, default=3.0)
-    parser.add_argument("--initial_cls_pool_weight", type=float, default=0.5)
-    parser.add_argument("--initial_topk_pool_weight", type=float, default=0.5)
+    parser.add_argument("--laplacian_temperature", type=float, default=0.2)
+    parser.add_argument("--spectral_uniform_mass", type=float, default=0.2)
+    parser.add_argument("--readout_temperature", type=float, default=1.0)
     parser.add_argument(
         "--prompt_source",
         choices=PROMPT_SOURCES,
@@ -104,38 +97,30 @@ def validate_args(parser, args):
         not args.feature_layers
         or min(args.feature_layers) < 1
         or args.feature_layers != sorted(set(args.feature_layers))
-        or args.hidden_dim < 1
     ):
         parser.error(
-            "feature_layers must be unique, positive, and strictly increasing; "
-            "hidden_dim must be positive"
+            "feature_layers must be unique, positive, and strictly increasing"
         )
     for name in (
         "text_temperature",
-        "low_frequency_temperature",
-        "high_frequency_temperature",
-        "semantic_graph_temperature",
-        "max_correction",
-        "gem_power",
+        "laplacian_temperature",
+        "readout_temperature",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"{name} must be positive")
-    if not 0 < args.topk_ratio <= 1:
-        parser.error("topk_ratio must lie in (0, 1]")
-    for name in ("initial_cls_pool_weight", "initial_topk_pool_weight"):
-        if not 0.1 < getattr(args, name) < 0.9:
-            parser.error(f"{name} must lie strictly inside (0.1, 0.9)")
+    if not 0 <= args.spectral_uniform_mass < 1:
+        parser.error("spectral_uniform_mass must lie in [0, 1)")
     if args.test_noise_severity < 0:
         parser.error("test_noise_severity must be non-negative")
 
 
 def configure_logger(save_path):
-    logger = logging.getLogger("test_v3")
+    logger = logging.getLogger("test_v4")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     file_handler = logging.FileHandler(
-        Path(save_path) / "test_v3.log",
+        Path(save_path) / "test_v4.log",
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
@@ -147,25 +132,18 @@ def configure_logger(save_path):
 
 
 @torch.inference_mode()
-def predict_class(
-    model,
-    text_embeddings,
-    dataloader,
-    device,
-    args,
-):
+def predict_class(model, text_embeddings, dataloader, device, args):
     masks = []
     labels = []
     score_maps = []
     image_scores = []
     mask_validity = []
     anomaly_mask_availability = []
-    for input_data in tqdm(dataloader, desc="V3 inference", leave=False):
+    for input_data in tqdm(dataloader, desc="V4 inference", leave=False):
         image = input_data["image"].to(device, non_blocking=True)
-        file_names = list(input_data["file_name"])
         image = deterministic_test_noise(
             image,
-            file_names,
+            list(input_data["file_name"]),
             args.dataset,
             args.test_noise_severity,
             args.seed,
@@ -231,14 +209,13 @@ def main():
     save_path.mkdir(parents=True, exist_ok=True)
     logger = configure_logger(save_path)
     logger.info("args: %s", vars(args))
-
     checkpoint_paths = sorted(
         [Path(path) for path in glob(str(save_path / args.checkpoint))],
         key=checkpoint_sort_key,
     )
     if not checkpoint_paths:
         raise FileNotFoundError(
-            f"no V3 checkpoint matches {save_path / args.checkpoint}"
+            f"no V4 checkpoint matches {save_path / args.checkpoint}"
         )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -251,19 +228,13 @@ def main():
         require_pretrained=True,
     )
     clip_model.eval()
-    model = FrozenSFGraphModel(
+    model = FrozenModalityGraphSpectralModel(
         clip_model=clip_model,
         feature_layers=args.feature_layers,
-        hidden_dim=args.hidden_dim,
         text_temperature=args.text_temperature,
-        low_frequency_temperature=args.low_frequency_temperature,
-        high_frequency_temperature=args.high_frequency_temperature,
-        semantic_graph_temperature=args.semantic_graph_temperature,
-        max_correction=args.max_correction,
-        topk_ratio=args.topk_ratio,
-        gem_power=args.gem_power,
-        initial_cls_pool_weight=args.initial_cls_pool_weight,
-        initial_topk_pool_weight=args.initial_topk_pool_weight,
+        laplacian_temperature=args.laplacian_temperature,
+        spectral_uniform_mass=args.spectral_uniform_mass,
+        readout_temperature=args.readout_temperature,
     ).to(device)
     model.eval()
     expected_architecture = model.architecture_config()
@@ -292,13 +263,13 @@ def main():
     all_rows = []
     for checkpoint_path in checkpoint_paths:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        validate_v3_checkpoint(checkpoint, expected_architecture)
+        validate_v4_checkpoint(checkpoint, expected_architecture)
         validate_checkpoint_prompt_metadata(
             checkpoint,
             args.prompt_source,
             args.dataset,
             args.llm_prompt_path,
-            f"V3 checkpoint {checkpoint_path}",
+            f"V4 checkpoint {checkpoint_path}",
         )
         if checkpoint.get("model_name") != args.model_name:
             raise ValueError(
@@ -324,19 +295,24 @@ def main():
                 f"LODO target mismatch for {checkpoint_path}: "
                 f"checkpoint={checkpoint_lodo_target}, test={args.dataset}"
             )
+
         model.load_head_state_dict(checkpoint["head"], strict=True)
         model.eval()
         epoch = int(checkpoint["epoch"])
-        pooling_state = model.pooling_state()
-        logger.info(
-            "checkpoint %s pooling | layers %s | CLS %.4f | Top-k %.4f",
-            checkpoint_path,
-            [round(weight, 4) for weight in pooling_state["layer_weights"]],
-            pooling_state["cls_weight"],
-            pooling_state["topk_weight"],
-        )
         class_results = []
         for class_name, image_dataset in image_datasets.items():
+            anchors = text_embedding_dict[class_name]
+            logger.info(
+                "checkpoint %s spectral weights | %s | layers %s x "
+                "orders 0/1/2: %s",
+                checkpoint_path,
+                class_name,
+                args.feature_layers,
+                [
+                    [round(value, 4) for value in row]
+                    for row in model.conditioning_weights(anchors)
+                ],
+            )
             dataloader = DataLoader(image_dataset, **dataloader_kwargs)
             (
                 masks,
@@ -345,23 +321,18 @@ def main():
                 image_scores,
                 mask_valid,
                 has_anomaly_mask,
-            ) = predict_class(
-                model,
-                text_embedding_dict[class_name],
-                dataloader,
-                device,
-                args,
+            ) = predict_class(model, anchors, dataloader, device, args)
+            class_results.append(
+                medical_metrics(
+                    masks,
+                    labels,
+                    score_maps,
+                    image_scores,
+                    class_name,
+                    mask_valid=mask_valid,
+                    has_anomaly_mask=has_anomaly_mask,
+                )
             )
-            result = v3_metrics(
-                masks,
-                labels,
-                score_maps,
-                image_scores,
-                class_name,
-                mask_valid=mask_valid,
-                has_anomaly_mask=has_anomaly_mask,
-            )
-            class_results.append(result)
         class_results.append(average_result(class_results))
 
         logger.info("checkpoint %s (epoch %d)", checkpoint_path, epoch)
@@ -390,7 +361,7 @@ def main():
     if not results_path.is_absolute():
         results_path = save_path / results_path
     write_results(results_path, all_rows)
-    print(f"V3 results saved to {results_path.resolve()}")
+    print(f"V4 results saved to {results_path.resolve()}")
 
 
 if __name__ == "__main__":

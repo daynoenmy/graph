@@ -4,17 +4,20 @@ cd /d "%~dp0"
 python train_v3.py ^
   --dataset Brain ^
   --training_mode full_shot ^
-  --save_path ./ckpt/v3_lesion_sfgraph ^
+  --save_path ./ckpt/v3_multilayer_sfgraph ^
   --prompt_source llm ^
   --llm_prompt_path ./dataset/llm_prompts.json ^
-  --feature_layer 18 ^
+  --feature_layers 6 12 18 24 ^
   --hidden_dim 32 ^
   --text_temperature 10.0 ^
   --low_frequency_temperature 0.2 ^
   --high_frequency_temperature 1.0 ^
   --semantic_graph_temperature 0.1 ^
   --max_correction 4.0 ^
-  --image_pool_temperature 10.0 ^
+  --topk_ratio 0.05 ^
+  --gem_power 3.0 ^
+  --initial_cls_pool_weight 0.5 ^
+  --initial_topk_pool_weight 0.5 ^
   --band_consistency_weight 0.05 ^
   --lesion_preservation_weight 0.05 ^
   --band_scale_min 0.5 ^

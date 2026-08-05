@@ -83,8 +83,9 @@ dataset/metadata/<数据集名称>/full-shot.jsonl
 | 异常，有 Mask | 是 | 是 | Mask 外 | Mask 内 |
 | 异常，无 Mask | 是 | 否 | 否 | 否 |
 
-异常无 Mask 样本仍然通过 Image BCE 学习图像级异常，并通过同一张 Patch 异常图的
-LogSumExp 池化把弱监督传递到 Head；代码不会为它伪造 Pixel 标签。
+异常无 Mask 样本仍然通过 Image BCE 学习图像级异常。受约束的 Top-k/GeM 局部分支
+把弱监督传递到各层图 Head，冻结 CLS 分支补充全局语义；代码不会为它伪造 Pixel
+标签。
 
 ## 训练一个 LODO Fold
 
@@ -106,7 +107,7 @@ Brain + Liver + Retina + Retina_OCT2017 + Histopathology
 checkpoint 保存到：
 
 ```text
-ckpt/v3_bmad_lodo/Chest
+ckpt/v3_bmad_lodo_multilayer/Chest
 ```
 
 ## 测试

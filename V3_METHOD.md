@@ -2,7 +2,7 @@
 
 ## 1. 方法定位
 
-V3 是与 V1 独立的实验分支，当前 checkpoint version 2 对应增强后的 V3.1。V1 通过
+V3 是与 V1 独立的实验分支，当前 checkpoint version 3 对应多层增强后的 V3.1。V1 通过
 Text/Image Adapter、双噪声视图和病灶保持 Patch Graph 适配 CLIP；V3.1 则完全冻结
 CLIP 图像与文本 Encoder，只在 Encoder 输出之后训练一个约 2.6 万参数的病灶保持
 空间—频率图残差头。
@@ -41,7 +41,7 @@ flowchart LR
     IMG["医学图像"] --> FROZEN["完全冻结的 CLIP Image Encoder"]
     PROMPT["固定 LLM Prompt Bank"] --> TEXT["完全冻结的 CLIP Text Encoder"]
     TEXT --> ANCHOR["正常与异常文本锚点"]
-    FROZEN --> PATCH["第 18 层冻结 Patch 特征"]
+    FROZEN --> PATCH["第 6/12/18/24 层冻结 Patch 特征"]
     PATCH --> SWT["固定平稳 Haar 小波"]
     SWT --> BANDS["低频结构与三个方向高频"]
     PATCH --> GRAPH["固定八邻域空间—频率图"]
@@ -51,19 +51,45 @@ flowchart LR
     PRIOR --> GRAPH
     GRAPH --> GATE["病灶共识门与孤立伪异常证据"]
     GATE --> HEAD["有界轻量图残差评分头"]
-    HEAD --> MAP["Pixel Anomaly Map"]
-    MAP --> LSE["LogSumExp 图像池化"]
-    LSE --> SCORE["Image Anomaly Score"]
+    HEAD --> PROB["分层 Patch 异常概率"]
+    PROB --> FUSE["非负受约束分层融合"]
+    FUSE --> MAP["Pixel Anomaly Map"]
+    PROB --> LOCAL["Top-k 局灶证据与 GeM 弥漫证据"]
+    FROZEN --> CLS["最终 CLS 全局特征"]
+    CLS --> GLOBAL["正常异常全局文本竞争"]
+    ANCHOR --> GLOBAL
+    LOCAL --> MIX["受约束全局局部融合"]
+    GLOBAL --> MIX
+    MIX --> SCORE["Image Anomaly Score"]
 ```
 
 ## 4. 冻结特征与文本先验
 
-给定图像 \(I\)，从冻结 CLIP 的指定中间层提取 patch token，并使用冻结的
+给定图像 \(I\)，从冻结 CLIP 的四个层级提取 patch token，并使用冻结的
 `ln_post` 与视觉投影得到：
 
 \[
-F=E_{\mathrm{frozen}}^{(l)}(I),\qquad l=18.
+F^{(l)}=E_{\mathrm{frozen}}^{(l)}(I),
+\qquad l\in\{6,12,18,24\}.
 \]
+
+四个层级分别经过同一个共享参数的空间—频率图 Head。融合发生在概率空间，而不是
+直接平均正负可互相抵消的 Logit：
+
+\[
+p_i^{(l)}=\sigma(s_i^{(l)}),\qquad
+w_l=\frac{\rho}{L}+(1-\rho)\operatorname{Softmax}(\omega)_l,
+\]
+
+\[
+p_i=\sum_l w_l p_i^{(l)},\qquad s_i=\operatorname{logit}(p_i).
+\]
+
+默认 \(L=4,\rho=0.2\)，因此每层权重至少为 0.05，且总和严格为 1。模型可在五个
+训练源上学习各层可靠性，又不能完全关闭任何一个尺度。
+
+浅层补充纹理与边缘，中层描述局部结构，深层提供高层语义。共享 Head 避免参数量随
+层数扩大，并使不同层级在同一异常评分规则下融合。
 
 LLM Prompt Bank 中同一状态的多条文本经冻结 Text Encoder 编码、平均并归一化，
 得到 \(t_n,t_a\)。Patch 异常概率和语义 margin 为：
@@ -79,8 +105,8 @@ a_i=\operatorname{Softmax}([z_{i,n},z_{i,a}])_a,
 \]
 
 所有 CLIP 参数的 `requires_grad=False`，模型处于 `eval()` 状态。checkpoint 只保存
-V3 Head，不复制 CLIP 权重。测试时会强制核对特征层、Head 维度、图边温度、修正
-上界以及图像级池化温度，避免训练和测试配置不一致却未被发现。
+图 Head、分层融合权重和图像池化权重，不复制 CLIP 权重。测试时会强制核对特征层、
+Head 维度、图边温度、修正上界以及池化结构，避免训练和测试配置不一致却未被发现。
 
 ## 5. 固定空间—频率变换
 
@@ -171,15 +197,35 @@ margin。默认 `C=4`，始终满足 \(|s_i-m_i|\leq4\)；当 \(|m_i|>4\) 时，
 不能翻转冻结语义判断的符号。这是一条可验证的有界修正性质，不是准确率保证。
 默认 `hidden_dim=32` 时，Head 约有 2.6 万参数。
 
-图像分数完全来自同一张异常图：
+图像级预测不再对所有 Patch 做平均或 LogSumExp 近似最大池化。对每层 Patch 概率，
+Top-k 分支保留小病灶的局部高响应，GeM 分支保留大面积或弥漫异常：
 
 \[
-S_{\mathrm{image}}
-=\frac{1}{\kappa}\log
-\left(\frac{1}{N}\sum_i\exp(\kappa s_i)\right).
+P_{\mathrm{topk}}^{(l)}=\frac{1}{K}\sum_{i\in\operatorname{TopK}}p_i^{(l)},
+\qquad
+P_{\mathrm{gem}}^{(l)}=
+\left(\frac{1}{N}\sum_i(p_i^{(l)})^q\right)^{1/q}.
 \]
 
-V3 不再额外使用 CLS 分支，避免 Pixel 与 Image 预测来自不同证据链。
+默认 \(K=\lceil0.05N\rceil,q=3\)。局部证据为：
+
+\[
+P_{\mathrm{local}}=\sum_l w_l
+\left[\beta P_{\mathrm{topk}}^{(l)}+(1-\beta)P_{\mathrm{gem}}^{(l)}\right].
+\]
+
+同时恢复冻结 CLIP 的最终 CLS 输出 \(c\)，并让它与同一组正常/异常文本锚点竞争：
+
+\[
+P_{\mathrm{cls}}=
+\operatorname{Softmax}\left(\tau c^\top[t_n,t_a]\right)_a,
+\qquad
+P_{\mathrm{image}}=\alpha P_{\mathrm{cls}}+(1-\alpha)P_{\mathrm{local}}.
+\]
+
+\(\alpha\) 和 \(\beta\) 是源域训练得到的两个标量，初始化为 0.5，并被限制在
+`[0.1, 0.9]`，保证全局/局部、局灶/弥漫证据都不能被完全关闭。CLS 只参与图像级
+判断，不进入 Pixel 异常图，因此不会直接平滑定位结果。
 
 ## 8. 训练目标
 
@@ -197,8 +243,9 @@ V3 不再额外使用 CLS 分支，避免 Pixel 与 Image 预测来自不同证�
 响应获得表面稳定性。两条分支只重新运行约 2.6 万参数的 Head，不生成第二张图，也不
 再次运行 CLIP Encoder。
 
-V3.1 checkpoint `version=2`。由于图输入维数与推理约束已经变化，早期 V3
-`version=1` checkpoint 不能直接加载，必须重新训练。
+V3.1 checkpoint `version=3`。由于特征输入升级为第 6、12、18、24 层概率融合，并
+加入可学习的 CLS/Top-k/GeM 图像池化，旧 `version=1/2` checkpoint 不能直接加载，
+必须重新训练。
 
 ## 9. 与 V1 的代码隔离
 
@@ -224,7 +271,7 @@ train_v3.bat
 默认使用 Brain full-shot，保存到：
 
 ```text
-ckpt/v3_lesion_sfgraph
+ckpt/v3_multilayer_sfgraph
 ```
 
 测试所有 epoch：
@@ -238,7 +285,7 @@ test_v3.bat
 ```bat
 python test_v3.py ^
   --dataset Liver ^
-  --save_path ./ckpt/v3_lesion_sfgraph ^
+  --save_path ./ckpt/v3_multilayer_sfgraph ^
   --checkpoint v3_head_epoch_*.pth ^
   --test_noise_severity 0.06
 ```
@@ -257,8 +304,10 @@ python test_v3.py ^
 7. + 双向 Band Consistency；
 8. + Lesion Preservation Loss；
 9. Template Prompt 与 LLM Prompt；
-10. 第 12、18、24 层特征；
-11. V1、原始 V3 与 V3.1 的参数量、显存、稳定性和跨域性能。
+10. 单层、第 12/18/24 层与第 6/12/18/24 层特征；
+11. Logit 平均、概率融合与受约束分层融合；
+12. Top-k、GeM、Top-k+GeM、仅 CLS 与完整全局—局部池化；
+13. V1、原始 V3 与 V3.1 的参数量、显存、稳定性和跨域性能。
 
 checkpoint 必须由 Brain 源域验证协议统一选择，不能分别查看 Liver、DDTI、Retina
 和 Colon 测试结果后选择不同 epoch。

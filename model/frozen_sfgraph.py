@@ -422,31 +422,215 @@ class SpatialFrequencyCoherenceHead(nn.Module):
         }
 
 
+class LayerProbabilityFusion(nn.Module):
+    """Fuse layer evidence in probability space with non-negative weights."""
+
+    def __init__(self, num_layers, minimum_uniform_mass=0.2, eps=1e-6):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be positive")
+        if not 0 <= minimum_uniform_mass < 1:
+            raise ValueError("minimum_uniform_mass must lie in [0, 1)")
+        self.num_layers = int(num_layers)
+        self.minimum_uniform_mass = float(minimum_uniform_mass)
+        self.eps = float(eps)
+        self.weight_logits = nn.Parameter(torch.zeros(self.num_layers))
+
+    def weights(self):
+        layer_floor = self.minimum_uniform_mass / self.num_layers
+        free_mass = 1.0 - self.minimum_uniform_mass
+        return layer_floor + free_mass * torch.softmax(
+            self.weight_logits,
+            dim=0,
+        )
+
+    def forward(self, per_layer_logits):
+        if per_layer_logits.ndim != 5 or per_layer_logits.shape[2] != 1:
+            raise ValueError(
+                "per_layer_logits must have shape [B, L, 1, H, W]"
+            )
+        if per_layer_logits.shape[1] != self.num_layers:
+            raise ValueError(
+                f"expected {self.num_layers} feature levels, "
+                f"got {per_layer_logits.shape[1]}"
+            )
+        weights = self.weights().to(dtype=per_layer_logits.dtype)
+        probability = torch.sigmoid(per_layer_logits)
+        fused_probability = (
+            probability * weights.view(1, -1, 1, 1, 1)
+        ).sum(dim=1)
+        return torch.logit(fused_probability.clamp(self.eps, 1.0 - self.eps))
+
+
+class ExtentAwareImagePool(nn.Module):
+    """Combine global semantics with focal and diffuse patch evidence."""
+
+    def __init__(
+        self,
+        embedding_dim,
+        text_temperature=10.0,
+        topk_ratio=0.05,
+        gem_power=3.0,
+        initial_cls_weight=0.5,
+        initial_topk_weight=0.5,
+        minimum_evidence_weight=0.1,
+        eps=1e-6,
+    ):
+        super().__init__()
+        if embedding_dim < 1:
+            raise ValueError("embedding_dim must be positive")
+        if text_temperature <= 0 or gem_power <= 0:
+            raise ValueError("text_temperature and gem_power must be positive")
+        if not 0 < topk_ratio <= 1:
+            raise ValueError("topk_ratio must lie in (0, 1]")
+        if not 0 <= minimum_evidence_weight < 0.5:
+            raise ValueError("minimum_evidence_weight must lie in [0, 0.5)")
+        lower = minimum_evidence_weight
+        upper = 1.0 - minimum_evidence_weight
+        if not lower < initial_cls_weight < upper:
+            raise ValueError(
+                "initial_cls_weight must lie strictly inside the constrained range"
+            )
+        if not lower < initial_topk_weight < upper:
+            raise ValueError(
+                "initial_topk_weight must lie strictly inside the constrained range"
+            )
+
+        self.embedding_dim = int(embedding_dim)
+        self.text_temperature = float(text_temperature)
+        self.topk_ratio = float(topk_ratio)
+        self.gem_power = float(gem_power)
+        self.minimum_evidence_weight = float(minimum_evidence_weight)
+        self.eps = float(eps)
+        self.cls_mix_logit = nn.Parameter(
+            torch.tensor(self._inverse_bounded_weight(initial_cls_weight))
+        )
+        self.topk_mix_logit = nn.Parameter(
+            torch.tensor(self._inverse_bounded_weight(initial_topk_weight))
+        )
+
+    def _inverse_bounded_weight(self, value):
+        floor = self.minimum_evidence_weight
+        unit_value = (float(value) - floor) / (1.0 - 2.0 * floor)
+        return math.log(unit_value / (1.0 - unit_value))
+
+    def _bounded_weight(self, parameter):
+        floor = self.minimum_evidence_weight
+        return floor + (1.0 - 2.0 * floor) * torch.sigmoid(parameter)
+
+    def _global_probability(self, global_features, text_embeddings):
+        if global_features.ndim != 2 or global_features.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"global_features must have shape [B, {self.embedding_dim}]"
+            )
+        SpatialFrequencyCoherenceHead._validate_text_embeddings(
+            text_embeddings,
+            global_features.shape[0],
+            self.embedding_dim,
+        )
+        normalized_global = F.normalize(global_features, dim=-1)
+        if text_embeddings.ndim == 2:
+            normalized_text = F.normalize(text_embeddings, dim=0)
+            logits = normalized_global @ normalized_text
+        else:
+            normalized_text = F.normalize(text_embeddings, dim=1)
+            logits = torch.matmul(normalized_global.unsqueeze(1), normalized_text)
+            logits = logits.squeeze(1)
+        return torch.softmax(logits * self.text_temperature, dim=-1)[:, 1]
+
+    def forward(
+        self,
+        per_layer_logits,
+        global_features,
+        text_embeddings,
+        layer_weights,
+        return_aux=False,
+    ):
+        if per_layer_logits.ndim != 5 or per_layer_logits.shape[2] != 1:
+            raise ValueError(
+                "per_layer_logits must have shape [B, L, 1, H, W]"
+            )
+        if layer_weights.ndim != 1 or layer_weights.numel() != per_layer_logits.shape[1]:
+            raise ValueError("layer_weights must contain one value per feature level")
+
+        patch_probability = torch.sigmoid(per_layer_logits).flatten(start_dim=3)
+        topk_count = max(1, math.ceil(patch_probability.shape[-1] * self.topk_ratio))
+        topk_probability = patch_probability.topk(topk_count, dim=-1).values.mean(dim=-1)
+        gem_probability = patch_probability.pow(self.gem_power).mean(dim=-1)
+        gem_probability = gem_probability.clamp_min(
+            torch.finfo(gem_probability.dtype).tiny
+        ).pow(1.0 / self.gem_power)
+
+        topk_weight = self._bounded_weight(self.topk_mix_logit)
+        per_layer_local = (
+            topk_weight * topk_probability
+            + (1.0 - topk_weight) * gem_probability
+        )
+        normalized_layer_weights = layer_weights.to(
+            device=per_layer_logits.device,
+            dtype=per_layer_logits.dtype,
+        )
+        normalized_layer_weights = normalized_layer_weights / normalized_layer_weights.sum()
+        local_probability = (
+            per_layer_local * normalized_layer_weights.view(1, -1, 1)
+        ).sum(dim=1).squeeze(1)
+
+        cls_probability = self._global_probability(global_features, text_embeddings)
+        cls_weight = self._bounded_weight(self.cls_mix_logit)
+        image_probability = (
+            cls_weight * cls_probability
+            + (1.0 - cls_weight) * local_probability
+        )
+        image_logits = torch.logit(
+            image_probability.clamp(self.eps, 1.0 - self.eps)
+        )
+        if not return_aux:
+            return image_logits
+        return image_logits, {
+            "image_probability": image_probability,
+            "cls_probability": cls_probability,
+            "local_probability": local_probability,
+            "per_layer_topk_probability": topk_probability.squeeze(-1),
+            "per_layer_gem_probability": gem_probability.squeeze(-1),
+            "cls_weight": cls_weight,
+            "topk_weight": topk_weight,
+        }
+
+
 class FrozenSFGraphModel(nn.Module):
     """Frozen CLIP feature extractor followed by the trainable SF graph head."""
 
     def __init__(
         self,
         clip_model,
-        feature_layer=18,
+        feature_layers=(6, 12, 18, 24),
         hidden_dim=32,
         text_temperature=10.0,
         low_frequency_temperature=0.2,
         high_frequency_temperature=1.0,
         semantic_graph_temperature=0.1,
         max_correction=4.0,
+        topk_ratio=0.05,
+        gem_power=3.0,
+        initial_cls_pool_weight=0.5,
+        initial_topk_pool_weight=0.5,
     ):
         super().__init__()
-        if feature_layer < 1:
-            raise ValueError("feature_layer must be positive")
+        feature_layers = tuple(int(layer) for layer in feature_layers)
+        if not feature_layers or min(feature_layers) < 1:
+            raise ValueError("feature_layers must contain positive layer indices")
+        if len(set(feature_layers)) != len(feature_layers):
+            raise ValueError("feature_layers must not contain duplicates")
+        if tuple(sorted(feature_layers)) != feature_layers:
+            raise ValueError("feature_layers must be strictly increasing")
         available_layers = len(clip_model.visual.transformer.resblocks)
-        if feature_layer > available_layers:
+        if max(feature_layers) > available_layers:
             raise ValueError(
-                f"feature_layer {feature_layer} exceeds the CLIP visual depth "
+                f"feature layer {max(feature_layers)} exceeds the CLIP visual depth "
                 f"{available_layers}"
             )
         self.clip_model = clip_model
-        self.feature_layer = int(feature_layer)
+        self.feature_layers = feature_layers
         embedding_dim = int(clip_model.visual.proj.shape[1])
         self.head = SpatialFrequencyCoherenceHead(
             embedding_dim=embedding_dim,
@@ -457,6 +641,15 @@ class FrozenSFGraphModel(nn.Module):
             semantic_graph_temperature=semantic_graph_temperature,
             max_correction=max_correction,
         )
+        self.layer_fusion = LayerProbabilityFusion(len(self.feature_layers))
+        self.image_pool = ExtentAwareImagePool(
+            embedding_dim=embedding_dim,
+            text_temperature=text_temperature,
+            topk_ratio=topk_ratio,
+            gem_power=gem_power,
+            initial_cls_weight=initial_cls_pool_weight,
+            initial_topk_weight=initial_topk_pool_weight,
+        )
         for parameter in self.clip_model.parameters():
             parameter.requires_grad = False
         self.clip_model.eval()
@@ -465,24 +658,68 @@ class FrozenSFGraphModel(nn.Module):
         super().train(mode)
         self.clip_model.eval()
         self.head.train(mode)
+        self.layer_fusion.train(mode)
+        self.image_pool.train(mode)
         return self
 
     @torch.no_grad()
     def encode_patches(self, image):
-        _, token_levels = self.clip_model.encode_image(
+        global_features, token_levels = self.clip_model.encode_image(
             image,
-            [self.feature_layer],
+            list(self.feature_layers),
         )
-        if len(token_levels) != 1:
+        if len(token_levels) != len(self.feature_layers):
             raise RuntimeError(
-                f"CLIP did not return feature layer {self.feature_layer}"
+                "CLIP returned an unexpected number of feature levels: "
+                f"expected {len(self.feature_layers)}, got {len(token_levels)}"
             )
-        tokens = token_levels[0]
-        patch_tokens = self.clip_model.visual._global_pool(tokens)[1]
-        patch_tokens = self.clip_model.visual.ln_post(patch_tokens)
-        if self.clip_model.visual.proj is not None:
-            patch_tokens = patch_tokens @ self.clip_model.visual.proj
-        return F.normalize(patch_tokens.float(), dim=-1)
+        patch_levels = []
+        for tokens in token_levels:
+            patch_tokens = self.clip_model.visual._global_pool(tokens)[1]
+            patch_tokens = self.clip_model.visual.ln_post(patch_tokens)
+            if self.clip_model.visual.proj is not None:
+                patch_tokens = patch_tokens @ self.clip_model.visual.proj
+            patch_levels.append(F.normalize(patch_tokens.float(), dim=-1))
+        return F.normalize(global_features.float(), dim=-1), tuple(patch_levels)
+
+    def _forward_feature_levels(
+        self,
+        patch_levels,
+        text_embeddings,
+        band_scales=None,
+        return_aux=False,
+    ):
+        level_outputs = [
+            self.head(
+                patch_features,
+                text_embeddings,
+                band_scales=band_scales,
+                return_aux=return_aux,
+            )
+            for patch_features in patch_levels
+        ]
+        level_logits = torch.stack(
+            [output[0] if return_aux else output for output in level_outputs],
+            dim=1,
+        )
+        fused_logits = self.layer_fusion(level_logits)
+        if not return_aux:
+            return fused_logits, level_logits
+
+        layer_weights = self.layer_fusion.weights().to(dtype=level_logits.dtype)
+        auxiliary = {
+            name: (
+                torch.stack(
+                    [level_output[1][name] for level_output in level_outputs],
+                    dim=1,
+                )
+                * layer_weights.view(1, -1, 1, 1, 1)
+            ).sum(dim=1)
+            for name in level_outputs[0][1]
+        }
+        auxiliary["per_layer_logits"] = level_logits
+        auxiliary["layer_weights"] = layer_weights
+        return fused_logits, level_logits, auxiliary
 
     def forward(
         self,
@@ -490,16 +727,39 @@ class FrozenSFGraphModel(nn.Module):
         text_embeddings,
         band_scales=None,
         return_aux=False,
+        return_image_logits=False,
         return_band_perturbation=False,
         band_scale_range=(0.5, 1.5),
     ):
-        patch_features = self.encode_patches(image)
-        output = self.head(
-            patch_features,
+        global_features, patch_levels = self.encode_patches(image)
+        feature_output = self._forward_feature_levels(
+            patch_levels,
             text_embeddings,
             band_scales=band_scales,
             return_aux=return_aux,
         )
+        if return_aux:
+            base_logits, per_layer_logits, auxiliary = feature_output
+        else:
+            base_logits, per_layer_logits = feature_output
+
+        image_logits = None
+        if return_image_logits:
+            image_logits = self.image_pool(
+                per_layer_logits,
+                global_features,
+                text_embeddings,
+                self.layer_fusion.weights(),
+            )
+
+        if return_aux:
+            if image_logits is not None:
+                auxiliary["image_logits"] = image_logits
+            output = (base_logits, auxiliary)
+        elif image_logits is not None:
+            output = (base_logits, image_logits)
+        else:
+            output = base_logits
         if not return_band_perturbation:
             return output
 
@@ -508,14 +768,13 @@ class FrozenSFGraphModel(nn.Module):
             raise ValueError("band scale range must lie in [0, 2]")
         band_index = int(torch.randint(0, 3, (), device=image.device))
         scale = float(torch.empty((), device=image.device).uniform_(minimum, maximum))
-        scales = patch_features.new_ones(3)
+        scales = patch_levels[0].new_ones(3)
         scales[band_index] = scale
-        perturbed_logits = self.head(
-            patch_features,
+        perturbed_logits, _ = self._forward_feature_levels(
+            patch_levels,
             text_embeddings,
             band_scales=scales,
         )
-        base_logits = output[0] if return_aux else output
         return (
             output,
             perturbed_logits,
@@ -528,16 +787,59 @@ class FrozenSFGraphModel(nn.Module):
 
     def trainable_parameters(self):
         yield from self.head.parameters()
+        yield from self.layer_fusion.parameters()
+        yield from self.image_pool.parameters()
 
     def head_state_dict(self):
-        return self.head.state_dict()
+        return {
+            "graph_head": self.head.state_dict(),
+            "layer_fusion": self.layer_fusion.state_dict(),
+            "image_pool": self.image_pool.state_dict(),
+        }
 
     def load_head_state_dict(self, state_dict, strict=True):
-        return self.head.load_state_dict(state_dict, strict=strict)
+        expected = {"graph_head", "layer_fusion", "image_pool"}
+        if set(state_dict) != expected:
+            raise ValueError(
+                "V3 trainable state must contain graph_head, layer_fusion, "
+                "and image_pool"
+            )
+        return {
+            "graph_head": self.head.load_state_dict(
+                state_dict["graph_head"],
+                strict=strict,
+            ),
+            "layer_fusion": self.layer_fusion.load_state_dict(
+                state_dict["layer_fusion"],
+                strict=strict,
+            ),
+            "image_pool": self.image_pool.load_state_dict(
+                state_dict["image_pool"],
+                strict=strict,
+            ),
+        }
+
+    @torch.no_grad()
+    def pooling_state(self):
+        return {
+            "layer_weights": self.layer_fusion.weights().detach().cpu().tolist(),
+            "cls_weight": float(self.image_pool._bounded_weight(
+                self.image_pool.cls_mix_logit
+            ).detach().cpu()),
+            "topk_weight": float(self.image_pool._bounded_weight(
+                self.image_pool.topk_mix_logit
+            ).detach().cpu()),
+        }
 
     def architecture_config(self):
         return {
-            "feature_layer": self.feature_layer,
+            "feature_layers": list(self.feature_layers),
+            "layer_fusion": "bounded_softmax_probability",
+            "minimum_uniform_layer_mass": self.layer_fusion.minimum_uniform_mass,
+            "image_pool": "cls_topk_gem_probability",
+            "topk_ratio": self.image_pool.topk_ratio,
+            "gem_power": self.image_pool.gem_power,
+            "minimum_evidence_weight": self.image_pool.minimum_evidence_weight,
             "embedding_dim": self.head.embedding_dim,
             "hidden_dim": self.head.hidden_dim,
             "text_temperature": self.head.text_temperature,
