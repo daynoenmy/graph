@@ -1,4 +1,4 @@
-"""Evaluate V4 modality-conditioned graph spectral checkpoints."""
+"""Evaluate V4.1 bounded graph-spectral residual checkpoints."""
 
 import argparse
 import csv
@@ -25,6 +25,7 @@ from utils import setup_seed
 from v4_utils import (
     checkpoint_sort_key,
     deterministic_test_noise,
+    frozen_modality_embedding,
     frozen_text_embedding_dict,
     medical_metrics,
     validate_v4_checkpoint,
@@ -47,7 +48,7 @@ RESULT_FIELDS = (
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Test V4 modality-conditioned graph spectral fusion"
+        description="Test V4.1 bounded modality-conditioned graph spectra"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -55,14 +56,14 @@ def build_parser():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=111)
-    parser.add_argument("--save_path", type=str, default="ckpt/v4_graph_spectral")
+    parser.add_argument("--save_path", type=str, default="ckpt/v4_1_graph_spectral")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="v4_head_epoch_*.pth",
+        default="v4_1_head_epoch_*.pth",
         help="checkpoint file name or glob pattern relative to save_path",
     )
-    parser.add_argument("--results_file", type=str, default="v4_results.csv")
+    parser.add_argument("--results_file", type=str, default="v4_1_results.csv")
     parser.add_argument("--test_noise_severity", type=float, default=0.0)
 
     parser.add_argument(
@@ -74,11 +75,12 @@ def build_parser():
     parser.add_argument("--text_temperature", type=float, default=10.0)
     parser.add_argument("--laplacian_temperature", type=float, default=0.2)
     parser.add_argument("--spectral_uniform_mass", type=float, default=0.2)
+    parser.add_argument("--max_spectral_coefficient", type=float, default=1.0)
     parser.add_argument("--readout_temperature", type=float, default=1.0)
     parser.add_argument(
         "--prompt_source",
         choices=PROMPT_SOURCES,
-        default="llm",
+        default="template",
     )
     parser.add_argument(
         "--llm_prompt_path",
@@ -98,12 +100,11 @@ def validate_args(parser, args):
         or min(args.feature_layers) < 1
         or args.feature_layers != sorted(set(args.feature_layers))
     ):
-        parser.error(
-            "feature_layers must be unique, positive, and strictly increasing"
-        )
+        parser.error("feature_layers must be unique, positive, and strictly increasing")
     for name in (
         "text_temperature",
         "laplacian_temperature",
+        "max_spectral_coefficient",
         "readout_temperature",
     ):
         if getattr(args, name) <= 0:
@@ -132,14 +133,21 @@ def configure_logger(save_path):
 
 
 @torch.inference_mode()
-def predict_class(model, text_embeddings, dataloader, device, args):
+def predict_class(
+    model,
+    text_embeddings,
+    modality_embedding,
+    dataloader,
+    device,
+    args,
+):
     masks = []
     labels = []
     score_maps = []
     image_scores = []
     mask_validity = []
     anomaly_mask_availability = []
-    for input_data in tqdm(dataloader, desc="V4 inference", leave=False):
+    for input_data in tqdm(dataloader, desc="V4.1 inference", leave=False):
         image = input_data["image"].to(device, non_blocking=True)
         image = deterministic_test_noise(
             image,
@@ -151,6 +159,7 @@ def predict_class(model, text_embeddings, dataloader, device, args):
         patch_logits, image_logits = model(
             image,
             text_embeddings,
+            modality_embedding,
             return_image_logits=True,
         )
         pixel_logits = F.interpolate(
@@ -215,7 +224,7 @@ def main():
     )
     if not checkpoint_paths:
         raise FileNotFoundError(
-            f"no V4 checkpoint matches {save_path / args.checkpoint}"
+            f"no V4.1 checkpoint matches {save_path / args.checkpoint}"
         )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -234,6 +243,7 @@ def main():
         text_temperature=args.text_temperature,
         laplacian_temperature=args.laplacian_temperature,
         spectral_uniform_mass=args.spectral_uniform_mass,
+        max_spectral_coefficient=args.max_spectral_coefficient,
         readout_temperature=args.readout_temperature,
     ).to(device)
     model.eval()
@@ -244,6 +254,11 @@ def main():
         device,
         args.prompt_source,
         args.llm_prompt_path,
+    )
+    modality_embedding = frozen_modality_embedding(
+        model.clip_model,
+        args.dataset,
+        device,
     )
     image_datasets = get_dataset(
         args.dataset,
@@ -269,7 +284,7 @@ def main():
             args.prompt_source,
             args.dataset,
             args.llm_prompt_path,
-            f"V4 checkpoint {checkpoint_path}",
+            f"V4.1 checkpoint {checkpoint_path}",
         )
         if checkpoint.get("model_name") != args.model_name:
             raise ValueError(
@@ -302,15 +317,17 @@ def main():
         class_results = []
         for class_name, image_dataset in image_datasets.items():
             anchors = text_embedding_dict[class_name]
+            conditioning = model.conditioning_state(modality_embedding)
             logger.info(
-                "checkpoint %s spectral weights | %s | layers %s x "
-                "orders 0/1/2: %s",
+                "checkpoint %s conditioning | %s | layers %s | weights %s | "
+                "L/L2 coefficients %s",
                 checkpoint_path,
                 class_name,
                 args.feature_layers,
+                [round(value, 4) for value in conditioning["layer_weights"]],
                 [
                     [round(value, 4) for value in row]
-                    for row in model.conditioning_weights(anchors)
+                    for row in conditioning["residual_coefficients"]
                 ],
             )
             dataloader = DataLoader(image_dataset, **dataloader_kwargs)
@@ -321,7 +338,14 @@ def main():
                 image_scores,
                 mask_valid,
                 has_anomaly_mask,
-            ) = predict_class(model, anchors, dataloader, device, args)
+            ) = predict_class(
+                model,
+                anchors,
+                modality_embedding,
+                dataloader,
+                device,
+                args,
+            )
             class_results.append(
                 medical_metrics(
                     masks,
@@ -361,7 +385,7 @@ def main():
     if not results_path.is_absolute():
         results_path = save_path / results_path
     write_results(results_path, all_rows)
-    print(f"V4 results saved to {results_path.resolve()}")
+    print(f"V4.1 results saved to {results_path.resolve()}")
 
 
 if __name__ == "__main__":

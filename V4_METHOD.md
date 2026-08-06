@@ -1,12 +1,16 @@
-# V4：模态条件化多层图拉普拉斯谱融合
+# V4.1：模态条件化多层图拉普拉斯残差融合
 
 ## 1. 方法定位
 
-V4 是与 V1、V3 独立的简化实验分支。它保留冻结 CLIP 第 6、12、18、24 层特征，
+V4.1 是与 V1、V3 独立的简化实验分支。它保留冻结 CLIP 第 6、12、18、24 层特征，
 但删除 V3 的 Haar 小波、复杂图残差 Head、病灶门、频带干预和多分支图像池化。
 
-V4 只有一个学习模块：根据冻结医学文本生成四个特征层、三个图拉普拉斯阶次的联合
-融合权重。CLIP Image Encoder 和 Text Encoder 始终完全冻结。
+V4.1 只有一个学习模块：根据固定人工模态模板生成四层权重，以及每层一阶、二阶
+图拉普拉斯的有界有符号残差系数。CLIP Image Encoder 和 Text Encoder 始终完全冻结。
+
+当前默认使用仓库原有的正常/异常模板文本（`--prompt_source template`），训练和测试
+过程中不调用 LLM。LLM Prompt Bank 只作为后续独立文本消融，不与模板 checkpoint
+混用。
 
 ## 2. 总体结构
 
@@ -21,7 +25,7 @@ V4 只有一个学习模块：根据冻结医学文本生成四个特征层、�
    ↓
 固定四邻域图拉普拉斯：m、Lm、L²m
    ↓
-模态文本条件化的 4×3 谱权重
+模态模板条件化的层权重与 L/L² 有界残差系数
    ↓
 Pixel Anomaly Map
    ├── 有效 Mask 的 Pixel Loss
@@ -29,7 +33,7 @@ Pixel Anomaly Map
 冻结最终 CLS Margin ─┴→ 固定平均 → Image BCE
 ```
 
-V4 当前只使用上下左右四个邻居，不使用 V3 的八邻域传播，也没有可训练图卷积。
+V4.1 当前只使用上下左右四个邻居，不使用 V3 的八邻域传播，也没有可训练图卷积。
 
 ## 3. 四层冻结文本异常响应
 
@@ -77,37 +81,57 @@ B_2^{(l)}=L^2m^{(l)}.
 
 它是同一个图算子的不同阶次，不再额外叠加小波频率分支。
 
-## 5. 模态条件化联合融合
+## 5. 模态条件化有界残差融合
 
-正常和异常锚点的共同部分用于形成模态—解剖条件向量：
+正常/异常锚点继续使用仓库原模板。条件生成器则独立使用以下固定人工模态模板：
+
+| 数据集 | 模态模板 |
+|---|---|
+| Brain | `a brain MRI scan` |
+| Liver | `a liver CT scan` |
+| Retina | `a retinal OCT scan` |
+| Chest | `a chest X-ray` |
+| Retina_OCT2017 | `a retinal OCT scan` |
+| Histopathology | `a histopathology microscopy image` |
+
+这些模板只描述已知成像模态，不由 LLM 生成，也不包含目标图像、诊断、Mask 或标签。
+冻结 Text Encoder 将对应模板编码为模态条件向量 \(t_m\)。
+
+条件生成器首先产生四层非负权重：
 
 \[
-t_m=\operatorname{Norm}\left(\frac{t_n+t_a}{2}\right).
+\alpha=\operatorname{Softmax}(W_\alpha t_m+b_\alpha),
+\qquad \sum_l\alpha_l=1.
 \]
 
-一个线性条件生成器输出十二个联合权重：
+默认保留 20% 均匀层权重质量，因此四层中每层至少占 5%。一阶、二阶谱系数使用
+有界 `tanh`：
 
 \[
-\pi=\operatorname{Softmax}(W t_m+b),
-\qquad \pi\in\mathbb R^{4\times3}.
+\beta_{l,k}=\beta_{max}\tanh
+\left((W_\beta t_m+b_\beta)_{l,k}\right),
+\qquad k\in\{1,2\}.
 \]
 
-最终异常图为：
+最终异常图为四层原始语义主干加图拉普拉斯残差：
 
 \[
-S=\sum_{l\in\{6,12,18,24\}}
-\sum_{k=0}^{2}\pi_{l,k}B_k^{(l)}.
+S=\sum_l\alpha_l\left[
+m^{(l)}+\beta_{l,1}Lm^{(l)}+\beta_{l,2}L^2m^{(l)}
+\right].
 \]
 
-默认保留 20% 均匀权重质量，避免源域训练完全关闭某个层级—谱阶组合。对于
-768 维 CLIP 特征，条件生成器只有 \(768\times12+12=9,228\) 个可训练参数。
+所有条件器参数初始化为零，因此训练开始时 \(\alpha_l=1/4\)、\(\beta_{l,k}=0\)，
+模型严格等于四层原始 CLIP Margin 均值。图拉普拉斯只能在训练后作为可正可负、幅度
+不超过 `max_spectral_coefficient` 的残差修正，不能在初始化时稀释原始语义。对于
+768 维 CLIP 特征，两组线性条件器合计仍为 9,228 个可训练参数。
 
-严格 LODO 时，目标数据集不参加训练；测试权重只由目标数据集的固定文本锚点生成，
+严格 LODO 时，目标数据集不参加训练；测试系数只由目标数据集的固定模态模板生成，
 不读取目标图像、Mask 或标签进行选择。
 
 ## 6. 固定图像读出与 CLS 基线
 
-V4 不训练 Top-k、GeM 或 CLS 混合权重。局部图像 Logit 使用固定温度的无参数注意力
+V4.1 不训练 Top-k、GeM 或 CLS 混合权重。局部图像 Logit 使用固定温度的无参数注意力
 读出：
 
 \[
@@ -137,9 +161,19 @@ z_{image}=\frac{z_{CLS}+z_{local}}{2}.
 Focal/Dice 损失。异常无 Mask 的 HIS、Chest 样本不会被伪造为全零异常图。
 
 \[
-\mathcal L=lambda_I\mathcal L_{image}
+\mathcal L=\lambda_I\mathcal L_{image}
 +\lambda_P\mathcal L_{pixel}.
 \]
+
+`train_v4.bat` 和 `train_v4_lodo.bat` 显式提供：
+
+```bat
+--image_loss_weight 1.0 ^
+--pixel_loss_weight 1.0 ^
+```
+
+可以手动把 Pixel Loss 权重改为 `0.5`、`0.25` 或其他非负值，但正式 LODO 实验必须
+根据源域验证协议统一选择，不能查看目标测试 AUC 后为不同目标分别调整。
 
 ## 8. 运行
 
@@ -160,9 +194,9 @@ test_v4_lodo.bat Chest
 默认保存目录为：
 
 ```text
-ckpt/v4_graph_spectral
-ckpt/v4_bmad_lodo/<TARGET>
+ckpt/v4_1_graph_spectral
+ckpt/v4_1_bmad_lodo/<TARGET>
 ```
 
-V4 checkpoint 使用独立方法标识 `modality_graph_spectral_v4` 和 `version=4`，不能与
-V3 checkpoint 混用。
+V4.1 checkpoint 使用独立方法标识 `modality_graph_spectral_v4_1`、`version=4` 和
+`revision=1`，并记录固定模态模板哈希。旧 V4、V3 checkpoint 均不能混用。

@@ -1,4 +1,4 @@
-"""Train V4: frozen CLIP with modality-conditioned graph spectra."""
+"""Train V4.1: frozen CLIP with bounded graph-spectral residuals."""
 
 import argparse
 import logging
@@ -25,17 +25,19 @@ from prompt_utils import (
 from utils import setup_seed
 from v4_utils import (
     binary_focal_dice_loss,
+    frozen_modality_embedding,
     frozen_text_embedding_dict,
+    modality_template_sha256,
     validate_v4_checkpoint,
 )
 
 
-DEFAULT_SAVE_PATH = "ckpt/v4_graph_spectral"
+DEFAULT_SAVE_PATH = "ckpt/v4_1_graph_spectral"
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Train V4 modality-conditioned graph spectral fusion"
+        description="Train V4.1 bounded modality-conditioned graph spectra"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -75,6 +77,7 @@ def build_parser():
     parser.add_argument("--text_temperature", type=float, default=10.0)
     parser.add_argument("--laplacian_temperature", type=float, default=0.2)
     parser.add_argument("--spectral_uniform_mass", type=float, default=0.2)
+    parser.add_argument("--max_spectral_coefficient", type=float, default=1.0)
     parser.add_argument("--readout_temperature", type=float, default=1.0)
     parser.add_argument("--image_loss_weight", type=float, default=1.0)
     parser.add_argument("--pixel_loss_weight", type=float, default=1.0)
@@ -82,7 +85,7 @@ def build_parser():
     parser.add_argument(
         "--prompt_source",
         choices=PROMPT_SOURCES,
-        default="llm",
+        default="template",
     )
     parser.add_argument(
         "--llm_prompt_path",
@@ -104,12 +107,11 @@ def validate_args(parser, args):
         or min(args.feature_layers) < 1
         or args.feature_layers != sorted(set(args.feature_layers))
     ):
-        parser.error(
-            "feature_layers must be unique, positive, and strictly increasing"
-        )
+        parser.error("feature_layers must be unique, positive, and strictly increasing")
     for name in (
         "text_temperature",
         "laplacian_temperature",
+        "max_spectral_coefficient",
         "readout_temperature",
     ):
         if getattr(args, name) <= 0:
@@ -155,7 +157,9 @@ def resolve_resume_checkpoint(save_path, checkpoint_name):
 def resolve_training_protocol(args):
     if args.lodo_target == "none":
         return [args.dataset], None
-    return [name for name in BMAD_DATASETS if name != args.lodo_target], args.lodo_target
+    return [
+        name for name in BMAD_DATASETS if name != args.lodo_target
+    ], args.lodo_target
 
 
 def validate_protocol_prompt_source(prompt_source, dataset_names, prompt_path):
@@ -222,8 +226,9 @@ def checkpoint_payload(
     lodo_target,
 ):
     return {
-        "method": "modality_graph_spectral_v4",
+        "method": "modality_graph_spectral_v4_1",
         "version": 4,
+        "revision": 1,
         "epoch": epoch,
         "encoder_frozen": True,
         "model_name": args.model_name,
@@ -235,23 +240,26 @@ def checkpoint_payload(
         "training_datasets": list(training_datasets),
         "lodo_target": lodo_target,
         "training_args": vars(args),
+        "modality_template_sha256": modality_template_sha256(),
         **prompt_metadata,
     }
 
 
-def log_conditioning_weights(model, text_embeddings, logger, epoch):
-    for dataset_name, class_embeddings in text_embeddings.items():
-        for class_name, anchors in class_embeddings.items():
-            matrix = model.conditioning_weights(anchors)
-            logger.info(
-                "epoch %d spectral weights | %s/%s | layers %s x "
-                "orders 0/1/2: %s",
-                epoch,
-                dataset_name,
-                class_name,
-                list(model.feature_layers),
-                [[round(value, 4) for value in row] for row in matrix],
-            )
+def log_conditioning_state(model, modality_embeddings, logger, epoch):
+    for dataset_name, modality_embedding in modality_embeddings.items():
+        state = model.conditioning_state(modality_embedding)
+        logger.info(
+            "epoch %d conditioning | %s | layers %s | weights %s | "
+            "L/L2 coefficients %s",
+            epoch,
+            dataset_name,
+            list(model.feature_layers),
+            [round(value, 4) for value in state["layer_weights"]],
+            [
+                [round(value, 4) for value in row]
+                for row in state["residual_coefficients"]
+            ],
+        )
 
 
 def main():
@@ -265,7 +273,7 @@ def main():
     if lodo_target is not None:
         prompt_datasets.append(lodo_target)
         if args.save_path == DEFAULT_SAVE_PATH:
-            args.save_path = str(Path("ckpt/v4_bmad_lodo") / lodo_target)
+            args.save_path = str(Path("ckpt/v4_1_bmad_lodo") / lodo_target)
     resolved_prompt_source = validate_protocol_prompt_source(
         args.prompt_source,
         prompt_datasets,
@@ -298,6 +306,7 @@ def main():
         text_temperature=args.text_temperature,
         laplacian_temperature=args.laplacian_temperature,
         spectral_uniform_mass=args.spectral_uniform_mass,
+        max_spectral_coefficient=args.max_spectral_coefficient,
         readout_temperature=args.readout_temperature,
     ).to(device)
     if any(parameter.requires_grad for parameter in model.clip_model.parameters()):
@@ -334,6 +343,14 @@ def main():
         )
         for dataset_name in training_datasets
     }
+    modality_embeddings = {
+        dataset_name: frozen_modality_embedding(
+            model.clip_model,
+            dataset_name,
+            device,
+        )
+        for dataset_name in training_datasets
+    }
 
     start_epoch = 0
     resume_path = resolve_resume_checkpoint(args.save_path, args.resume_checkpoint)
@@ -345,7 +362,7 @@ def main():
             resolved_prompt_source,
             training_datasets[0],
             args.llm_prompt_path,
-            f"V4 checkpoint {resume_path}",
+            f"V4.1 checkpoint {resume_path}",
         )
         if checkpoint.get("model_name") != args.model_name:
             raise ValueError("resume checkpoint model_name does not match arguments")
@@ -378,7 +395,7 @@ def main():
         image_losses = []
         pixel_supervised_samples = 0
         total_samples = 0
-        progress = tqdm(dataloader, desc=f"V4 epoch {epoch + 1}/{args.epochs}")
+        progress = tqdm(dataloader, desc=f"V4.1 epoch {epoch + 1}/{args.epochs}")
         for input_data in progress:
             image = input_data["image"].to(device, non_blocking=True)
             mask = input_data["mask"].to(device, non_blocking=True).float()
@@ -393,11 +410,16 @@ def main():
                 ],
                 dim=0,
             )
+            batch_modality = torch.stack(
+                [modality_embeddings[name] for name in dataset_names],
+                dim=0,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             patch_logits, image_logits = model(
                 image,
                 batch_text,
+                batch_modality,
                 return_image_logits=True,
             )
             pixel_logits = F.interpolate(
@@ -439,9 +461,9 @@ def main():
             total_samples,
             dict(zip(training_datasets, dataset_lengths)),
         )
-        log_conditioning_weights(
+        log_conditioning_state(
             model,
-            text_embeddings,
+            modality_embeddings,
             logger,
             epoch + 1,
         )
@@ -454,10 +476,10 @@ def main():
             training_datasets,
             lodo_target,
         )
-        torch.save(payload, save_path / "v4_head_latest.pth")
-        torch.save(payload, save_path / f"v4_head_epoch_{epoch + 1}.pth")
+        torch.save(payload, save_path / "v4_1_head_latest.pth")
+        torch.save(payload, save_path / f"v4_1_head_epoch_{epoch + 1}.pth")
 
-    logger.info("V4 training complete")
+    logger.info("V4.1 training complete")
 
 
 if __name__ == "__main__":

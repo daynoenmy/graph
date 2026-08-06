@@ -131,15 +131,22 @@ test_v3_lodo.bat Chest
 See [BMAD_LODO.md](BMAD_LODO.md) for dataset paths, optional-mask JSONL schema,
 the six folds, loss routing, metric rules, and target-domain leakage controls.
 
-### 6. V4: modality-conditioned multi-layer graph spectra
+### 6. V4.1: modality-conditioned graph-spectral residuals
 
-V4 is an independent simplification branch. It keeps frozen CLIP layers
-6/12/18/24, constructs the fixed four-neighbor Laplacian bases
-`margin`, `L margin`, and `L^2 margin`, and uses one text-conditioned linear
-generator to assign the joint 4-by-3 spectral weights. The final CLS/local
-readout is fixed. V4 trains only 9,228 parameters for ViT-L/14 and uses Image
-BCE plus valid-mask Pixel Focal/Dice; it does not use the V3 Haar, graph head,
-lesion gate, band intervention, Top-k, or GeM modules.
+V4.1 is an independent simplification branch. It keeps frozen CLIP layers
+6/12/18/24 and constructs fixed four-neighbor Laplacian bases `margin`,
+`L margin`, and `L^2 margin`. The original CLIP margin remains the semantic
+backbone. A small conditioner predicts four non-negative layer weights and
+bounded signed `L/L^2` residual coefficients instead of treating all twelve
+bases as interchangeable evidence. The conditioner uses a separate fixed
+hand-written modality phrase such as `a brain MRI scan` or `a chest X-ray`;
+normal/abnormal anchors still use the repository templates. No LLM is called.
+
+The final CLS/local readout is fixed. V4.1 trains only 9,228 parameters for
+ViT-L/14 and uses Image BCE plus valid-mask Pixel Focal/Dice; it does not use
+the V3 Haar, graph head, lesion gate, band intervention, Top-k, or GeM modules.
+Both training batch files expose `--pixel_loss_weight`, so the Pixel Loss
+contribution can be changed directly without editing Python.
 
 ```bat
 train_v4_lodo.bat Chest
@@ -147,9 +154,9 @@ test_v4_lodo.bat Chest
 ```
 
 See [V4_METHOD.md](V4_METHOD.md) for the exact Laplacian, fusion equation,
-mixed-supervision routing, and checkpoint contract. V4 checkpoints are stored
-under `ckpt/v4_graph_spectral` or `ckpt/v4_bmad_lodo/<TARGET>` and cannot be
-loaded by V3.
+mixed-supervision routing, and checkpoint contract. V4.1 checkpoints are stored
+under `ckpt/v4_1_graph_spectral` or `ckpt/v4_1_bmad_lodo/<TARGET>` and cannot be
+mixed with old V4 or V3 checkpoints.
 
 For a paired medical case study against the original AA-CLIP, run:
 
