@@ -1,4 +1,4 @@
-"""Train V4.1: frozen CLIP with bounded graph-spectral residuals."""
+"""Train V4.2-SSC semantic-spectral coupling."""
 
 import argparse
 import logging
@@ -24,7 +24,11 @@ from prompt_utils import (
 )
 from utils import setup_seed
 from v4_utils import (
+    anchor_template_sha256,
+    aspect_geometry_diagnostics,
+    aspect_template_sha256,
     binary_focal_dice_loss,
+    frozen_aspect_embeddings,
     frozen_modality_embedding,
     frozen_text_embedding_dict,
     modality_template_sha256,
@@ -32,12 +36,12 @@ from v4_utils import (
 )
 
 
-DEFAULT_SAVE_PATH = "ckpt/v4_1_graph_spectral"
+DEFAULT_SAVE_PATH = "ckpt/v4_2_ssc"
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Train V4.1 bounded modality-conditioned graph spectra"
+        description="Train V4.2-SSC semantic-spectral coupling"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -78,6 +82,14 @@ def build_parser():
     parser.add_argument("--laplacian_temperature", type=float, default=0.2)
     parser.add_argument("--spectral_uniform_mass", type=float, default=0.2)
     parser.add_argument("--max_spectral_coefficient", type=float, default=1.0)
+    parser.add_argument("--aspect_temperature", type=float, default=10.0)
+    parser.add_argument(
+        "--aspect_coupling_strength",
+        type=float,
+        choices=(0.0, 1.0),
+        default=1.0,
+        help="1 enables SSC; 0 is the no-coupling ablation",
+    )
     parser.add_argument("--readout_temperature", type=float, default=1.0)
     parser.add_argument("--image_loss_weight", type=float, default=1.0)
     parser.add_argument("--pixel_loss_weight", type=float, default=1.0)
@@ -112,6 +124,7 @@ def validate_args(parser, args):
         "text_temperature",
         "laplacian_temperature",
         "max_spectral_coefficient",
+        "aspect_temperature",
         "readout_temperature",
     ):
         if getattr(args, name) <= 0:
@@ -226,9 +239,9 @@ def checkpoint_payload(
     lodo_target,
 ):
     return {
-        "method": "modality_graph_spectral_v4_1",
+        "method": "modality_graph_spectral_v4_2_ssc",
         "version": 4,
-        "revision": 1,
+        "revision": 2,
         "epoch": epoch,
         "encoder_frozen": True,
         "model_name": args.model_name,
@@ -241,6 +254,8 @@ def checkpoint_payload(
         "lodo_target": lodo_target,
         "training_args": vars(args),
         "modality_template_sha256": modality_template_sha256(),
+        "aspect_template_sha256": aspect_template_sha256(),
+        "anchor_template_sha256": anchor_template_sha256(),
         **prompt_metadata,
     }
 
@@ -260,6 +275,15 @@ def log_conditioning_state(model, modality_embeddings, logger, epoch):
                 for row in state["residual_coefficients"]
             ],
         )
+    state = model.conditioning_state(next(iter(modality_embeddings.values())))
+    logger.info(
+        "epoch %d shared aspect coupling (focal/diffuse/structural x L/L2): %s",
+        epoch,
+        [
+            [round(value, 4) for value in row]
+            for row in state["aspect_coupling"]
+        ],
+    )
 
 
 def main():
@@ -273,7 +297,7 @@ def main():
     if lodo_target is not None:
         prompt_datasets.append(lodo_target)
         if args.save_path == DEFAULT_SAVE_PATH:
-            args.save_path = str(Path("ckpt/v4_1_bmad_lodo") / lodo_target)
+            args.save_path = str(Path("ckpt/v4_2_ssc_bmad_lodo") / lodo_target)
     resolved_prompt_source = validate_protocol_prompt_source(
         args.prompt_source,
         prompt_datasets,
@@ -307,6 +331,8 @@ def main():
         laplacian_temperature=args.laplacian_temperature,
         spectral_uniform_mass=args.spectral_uniform_mass,
         max_spectral_coefficient=args.max_spectral_coefficient,
+        aspect_temperature=args.aspect_temperature,
+        aspect_coupling_strength=args.aspect_coupling_strength,
         readout_temperature=args.readout_temperature,
     ).to(device)
     if any(parameter.requires_grad for parameter in model.clip_model.parameters()):
@@ -351,6 +377,35 @@ def main():
         )
         for dataset_name in training_datasets
     }
+    aspect_embeddings = {
+        dataset_name: frozen_aspect_embeddings(
+            model.clip_model,
+            dataset_name,
+            device,
+        )
+        for dataset_name in training_datasets
+    }
+    for dataset_name, class_anchors in text_embeddings.items():
+        for class_name, anchors in class_anchors.items():
+            geometry = aspect_geometry_diagnostics(
+                anchors,
+                aspect_embeddings[dataset_name],
+            )
+            logger.info(
+                "aspect geometry | %s/%s | raw cosine %s | "
+                "normal-relative cosine %s | contrast norms %s",
+                dataset_name,
+                class_name,
+                [
+                    [round(value, 4) for value in row]
+                    for row in geometry["raw_cosine"]
+                ],
+                [
+                    [round(value, 4) for value in row]
+                    for row in geometry["contrast_cosine"]
+                ],
+                [round(value, 4) for value in geometry["contrast_norms"]],
+            )
 
     start_epoch = 0
     resume_path = resolve_resume_checkpoint(args.save_path, args.resume_checkpoint)
@@ -362,7 +417,7 @@ def main():
             resolved_prompt_source,
             training_datasets[0],
             args.llm_prompt_path,
-            f"V4.1 checkpoint {resume_path}",
+            f"V4.2-SSC checkpoint {resume_path}",
         )
         if checkpoint.get("model_name") != args.model_name:
             raise ValueError("resume checkpoint model_name does not match arguments")
@@ -395,7 +450,7 @@ def main():
         image_losses = []
         pixel_supervised_samples = 0
         total_samples = 0
-        progress = tqdm(dataloader, desc=f"V4.1 epoch {epoch + 1}/{args.epochs}")
+        progress = tqdm(dataloader, desc=f"V4.2-SSC epoch {epoch + 1}/{args.epochs}")
         for input_data in progress:
             image = input_data["image"].to(device, non_blocking=True)
             mask = input_data["mask"].to(device, non_blocking=True).float()
@@ -414,12 +469,17 @@ def main():
                 [modality_embeddings[name] for name in dataset_names],
                 dim=0,
             )
+            batch_aspects = torch.stack(
+                [aspect_embeddings[name] for name in dataset_names],
+                dim=0,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             patch_logits, image_logits = model(
                 image,
                 batch_text,
                 batch_modality,
+                batch_aspects,
                 return_image_logits=True,
             )
             pixel_logits = F.interpolate(
@@ -476,10 +536,10 @@ def main():
             training_datasets,
             lodo_target,
         )
-        torch.save(payload, save_path / "v4_1_head_latest.pth")
-        torch.save(payload, save_path / f"v4_1_head_epoch_{epoch + 1}.pth")
+        torch.save(payload, save_path / "v4_2_ssc_head_latest.pth")
+        torch.save(payload, save_path / f"v4_2_ssc_head_epoch_{epoch + 1}.pth")
 
-    logger.info("V4.1 training complete")
+    logger.info("V4.2-SSC training complete")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Evaluate V4.1 bounded graph-spectral residual checkpoints."""
+"""Evaluate V4.2-SSC semantic-spectral coupling checkpoints."""
 
 import argparse
 import csv
@@ -23,8 +23,11 @@ from prompt_utils import (
 )
 from utils import setup_seed
 from v4_utils import (
+    V4_ASPECT_NAMES,
+    aspect_geometry_diagnostics,
     checkpoint_sort_key,
     deterministic_test_noise,
+    frozen_aspect_embeddings,
     frozen_modality_embedding,
     frozen_text_embedding_dict,
     medical_metrics,
@@ -42,13 +45,34 @@ RESULT_FIELDS = (
     "image AUC",
     "image AP",
     "masked anomaly coverage",
+    "focal compatibility mean",
+    "focal compatibility std",
+    "diffuse compatibility mean",
+    "diffuse compatibility std",
+    "structural compatibility mean",
+    "structural compatibility std",
+    "focal normal mean",
+    "focal abnormal mean",
+    "focal compatibility gap",
+    "focal saturation rate",
+    "diffuse normal mean",
+    "diffuse abnormal mean",
+    "diffuse compatibility gap",
+    "diffuse saturation rate",
+    "structural normal mean",
+    "structural abnormal mean",
+    "structural compatibility gap",
+    "structural saturation rate",
+    "focal-diffuse correlation",
+    "focal-structural correlation",
+    "diffuse-structural correlation",
     "test noise severity",
 )
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Test V4.1 bounded modality-conditioned graph spectra"
+        description="Test V4.2-SSC semantic-spectral coupling"
     )
     parser.add_argument("--model_name", type=str, default="ViT-L-14-336")
     parser.add_argument("--img_size", type=int, default=518)
@@ -56,14 +80,14 @@ def build_parser():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=111)
-    parser.add_argument("--save_path", type=str, default="ckpt/v4_1_graph_spectral")
+    parser.add_argument("--save_path", type=str, default="ckpt/v4_2_ssc")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="v4_1_head_epoch_*.pth",
+        default="v4_2_ssc_head_epoch_*.pth",
         help="checkpoint file name or glob pattern relative to save_path",
     )
-    parser.add_argument("--results_file", type=str, default="v4_1_results.csv")
+    parser.add_argument("--results_file", type=str, default="v4_2_ssc_results.csv")
     parser.add_argument("--test_noise_severity", type=float, default=0.0)
 
     parser.add_argument(
@@ -76,6 +100,14 @@ def build_parser():
     parser.add_argument("--laplacian_temperature", type=float, default=0.2)
     parser.add_argument("--spectral_uniform_mass", type=float, default=0.2)
     parser.add_argument("--max_spectral_coefficient", type=float, default=1.0)
+    parser.add_argument("--aspect_temperature", type=float, default=10.0)
+    parser.add_argument(
+        "--aspect_coupling_strength",
+        type=float,
+        choices=(0.0, 1.0),
+        default=1.0,
+        help="1 enables SSC; 0 is the no-coupling ablation",
+    )
     parser.add_argument("--readout_temperature", type=float, default=1.0)
     parser.add_argument(
         "--prompt_source",
@@ -105,6 +137,7 @@ def validate_args(parser, args):
         "text_temperature",
         "laplacian_temperature",
         "max_spectral_coefficient",
+        "aspect_temperature",
         "readout_temperature",
     ):
         if getattr(args, name) <= 0:
@@ -137,6 +170,7 @@ def predict_class(
     model,
     text_embeddings,
     modality_embedding,
+    aspect_embeddings,
     dataloader,
     device,
     args,
@@ -147,7 +181,8 @@ def predict_class(
     image_scores = []
     mask_validity = []
     anomaly_mask_availability = []
-    for input_data in tqdm(dataloader, desc="V4.1 inference", leave=False):
+    aspect_compatibilities = []
+    for input_data in tqdm(dataloader, desc="V4.2-SSC inference", leave=False):
         image = input_data["image"].to(device, non_blocking=True)
         image = deterministic_test_noise(
             image,
@@ -156,12 +191,14 @@ def predict_class(
             args.test_noise_severity,
             args.seed,
         )
-        patch_logits, image_logits = model(
+        patch_logits, auxiliary = model(
             image,
             text_embeddings,
             modality_embedding,
-            return_image_logits=True,
+            aspect_embeddings,
+            return_aux=True,
         )
+        image_logits = auxiliary["image_logits"]
         pixel_logits = F.interpolate(
             patch_logits,
             size=input_data["mask"].shape[-2:],
@@ -176,6 +213,9 @@ def predict_class(
         anomaly_mask_availability.append(
             input_data["has_anomaly_mask"].cpu().numpy().reshape(-1)
         )
+        aspect_compatibilities.append(
+            auxiliary["aspect_compatibilities"].cpu().numpy()
+        )
     return (
         np.concatenate(masks, axis=0),
         np.concatenate(labels, axis=0),
@@ -183,6 +223,7 @@ def predict_class(
         np.concatenate(image_scores, axis=0),
         np.concatenate(mask_validity, axis=0),
         np.concatenate(anomaly_mask_availability, axis=0),
+        np.concatenate(aspect_compatibilities, axis=0),
     )
 
 
@@ -194,10 +235,75 @@ def average_result(class_results):
         "image AUC",
         "image AP",
         "masked anomaly coverage",
+        "focal compatibility mean",
+        "focal compatibility std",
+        "diffuse compatibility mean",
+        "diffuse compatibility std",
+        "structural compatibility mean",
+        "structural compatibility std",
+        "focal normal mean",
+        "focal abnormal mean",
+        "focal compatibility gap",
+        "focal saturation rate",
+        "diffuse normal mean",
+        "diffuse abnormal mean",
+        "diffuse compatibility gap",
+        "diffuse saturation rate",
+        "structural normal mean",
+        "structural abnormal mean",
+        "structural compatibility gap",
+        "structural saturation rate",
+        "focal-diffuse correlation",
+        "focal-structural correlation",
+        "diffuse-structural correlation",
     ):
         values = np.asarray([result[name] for result in class_results], dtype=float)
         row[name] = float(np.nanmean(values)) if not np.isnan(values).all() else np.nan
     return row
+
+
+def _safe_subset_mean(values, selector):
+    selected = np.asarray(values, dtype=float)[np.asarray(selector, dtype=bool)]
+    return float(selected.mean()) if selected.size else float("nan")
+
+
+def aspect_compatibility_statistics(aspect_scores, labels):
+    aspect_scores = np.asarray(aspect_scores, dtype=float)
+    labels = np.asarray(labels).reshape(-1)
+    expected = (labels.shape[0], len(V4_ASPECT_NAMES))
+    if aspect_scores.shape != expected:
+        raise ValueError(
+            f"aspect_scores must have shape {expected}, got {aspect_scores.shape}"
+        )
+    normal = labels == 0
+    abnormal = labels != 0
+    statistics = {}
+    for index, aspect_name in enumerate(V4_ASPECT_NAMES):
+        values = aspect_scores[:, index]
+        normal_mean = _safe_subset_mean(values, normal)
+        abnormal_mean = _safe_subset_mean(values, abnormal)
+        statistics[f"{aspect_name} normal mean"] = normal_mean
+        statistics[f"{aspect_name} abnormal mean"] = abnormal_mean
+        statistics[f"{aspect_name} compatibility gap"] = (
+            abnormal_mean - normal_mean
+            if np.isfinite(normal_mean) and np.isfinite(abnormal_mean)
+            else float("nan")
+        )
+        statistics[f"{aspect_name} saturation rate"] = float(
+            ((values < 0.05) | (values > 0.95)).mean()
+        )
+
+    for left_index, right_index in ((0, 1), (0, 2), (1, 2)):
+        left_name = V4_ASPECT_NAMES[left_index]
+        right_name = V4_ASPECT_NAMES[right_index]
+        left = aspect_scores[:, left_index]
+        right = aspect_scores[:, right_index]
+        if left.size < 2 or left.std() == 0 or right.std() == 0:
+            correlation = float("nan")
+        else:
+            correlation = float(np.corrcoef(left, right)[0, 1])
+        statistics[f"{left_name}-{right_name} correlation"] = correlation
+    return statistics
 
 
 def write_results(path, rows):
@@ -224,7 +330,7 @@ def main():
     )
     if not checkpoint_paths:
         raise FileNotFoundError(
-            f"no V4.1 checkpoint matches {save_path / args.checkpoint}"
+            f"no V4.2-SSC checkpoint matches {save_path / args.checkpoint}"
         )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -244,6 +350,8 @@ def main():
         laplacian_temperature=args.laplacian_temperature,
         spectral_uniform_mass=args.spectral_uniform_mass,
         max_spectral_coefficient=args.max_spectral_coefficient,
+        aspect_temperature=args.aspect_temperature,
+        aspect_coupling_strength=args.aspect_coupling_strength,
         readout_temperature=args.readout_temperature,
     ).to(device)
     model.eval()
@@ -260,6 +368,28 @@ def main():
         args.dataset,
         device,
     )
+    aspect_embeddings = frozen_aspect_embeddings(
+        model.clip_model,
+        args.dataset,
+        device,
+    )
+    for class_name, anchors in text_embedding_dict.items():
+        geometry = aspect_geometry_diagnostics(anchors, aspect_embeddings)
+        logger.info(
+            "aspect geometry | %s/%s | raw cosine %s | "
+            "normal-relative cosine %s | contrast norms %s",
+            args.dataset,
+            class_name,
+            [
+                [round(value, 4) for value in row]
+                for row in geometry["raw_cosine"]
+            ],
+            [
+                [round(value, 4) for value in row]
+                for row in geometry["contrast_cosine"]
+            ],
+            [round(value, 4) for value in geometry["contrast_norms"]],
+        )
     image_datasets = get_dataset(
         args.dataset,
         args.img_size,
@@ -284,7 +414,7 @@ def main():
             args.prompt_source,
             args.dataset,
             args.llm_prompt_path,
-            f"V4.1 checkpoint {checkpoint_path}",
+            f"V4.2-SSC checkpoint {checkpoint_path}",
         )
         if checkpoint.get("model_name") != args.model_name:
             raise ValueError(
@@ -320,7 +450,7 @@ def main():
             conditioning = model.conditioning_state(modality_embedding)
             logger.info(
                 "checkpoint %s conditioning | %s | layers %s | weights %s | "
-                "L/L2 coefficients %s",
+                "base L/L2 coefficients %s | aspect coupling %s",
                 checkpoint_path,
                 class_name,
                 args.feature_layers,
@@ -328,6 +458,10 @@ def main():
                 [
                     [round(value, 4) for value in row]
                     for row in conditioning["residual_coefficients"]
+                ],
+                [
+                    [round(value, 4) for value in row]
+                    for row in conditioning["aspect_coupling"]
                 ],
             )
             dataloader = DataLoader(image_dataset, **dataloader_kwargs)
@@ -338,25 +472,57 @@ def main():
                 image_scores,
                 mask_valid,
                 has_anomaly_mask,
+                aspect_scores,
             ) = predict_class(
                 model,
                 anchors,
                 modality_embedding,
+                aspect_embeddings,
                 dataloader,
                 device,
                 args,
             )
-            class_results.append(
-                medical_metrics(
-                    masks,
-                    labels,
-                    score_maps,
-                    image_scores,
-                    class_name,
-                    mask_valid=mask_valid,
-                    has_anomaly_mask=has_anomaly_mask,
-                )
+            result = medical_metrics(
+                masks,
+                labels,
+                score_maps,
+                image_scores,
+                class_name,
+                mask_valid=mask_valid,
+                has_anomaly_mask=has_anomaly_mask,
             )
+            for index, aspect_name in enumerate(V4_ASPECT_NAMES):
+                result[f"{aspect_name} compatibility mean"] = float(
+                    aspect_scores[:, index].mean()
+                )
+                result[f"{aspect_name} compatibility std"] = float(
+                    aspect_scores[:, index].std()
+                )
+            result.update(aspect_compatibility_statistics(aspect_scores, labels))
+            logger.info(
+                "%s aspect compatibility diagnostics: %s",
+                class_name,
+                {
+                    name: {
+                        "mean": round(result[f"{name} compatibility mean"], 4),
+                        "std": round(result[f"{name} compatibility std"], 4),
+                        "normal": round(result[f"{name} normal mean"], 4),
+                        "abnormal": round(result[f"{name} abnormal mean"], 4),
+                        "gap": round(result[f"{name} compatibility gap"], 4),
+                        "saturation": round(result[f"{name} saturation rate"], 4),
+                    }
+                    for name in V4_ASPECT_NAMES
+                },
+            )
+            logger.info(
+                "%s aspect compatibility correlations: focal/diffuse %.4f | "
+                "focal/structural %.4f | diffuse/structural %.4f",
+                class_name,
+                result["focal-diffuse correlation"],
+                result["focal-structural correlation"],
+                result["diffuse-structural correlation"],
+            )
+            class_results.append(result)
         class_results.append(average_result(class_results))
 
         logger.info("checkpoint %s (epoch %d)", checkpoint_path, epoch)
@@ -385,7 +551,7 @@ def main():
     if not results_path.is_absolute():
         results_path = save_path / results_path
     write_results(results_path, all_rows)
-    print(f"V4.1 results saved to {results_path.resolve()}")
+    print(f"V4.2-SSC results saved to {results_path.resolve()}")
 
 
 if __name__ == "__main__":

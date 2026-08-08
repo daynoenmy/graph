@@ -131,18 +131,21 @@ test_v3_lodo.bat Chest
 See [BMAD_LODO.md](BMAD_LODO.md) for dataset paths, optional-mask JSONL schema,
 the six folds, loss routing, metric rules, and target-domain leakage controls.
 
-### 6. V4.1: modality-conditioned graph-spectral residuals
+### 6. V4.2-SSC: semantic-spectral coupling
 
-V4.1 is an independent simplification branch. It keeps frozen CLIP layers
+V4.2-SSC keeps frozen CLIP layers
 6/12/18/24 and constructs fixed four-neighbor Laplacian bases `margin`,
 `L margin`, and `L^2 margin`. The original CLIP margin remains the semantic
 backbone. A small conditioner predicts four non-negative layer weights and
 bounded signed `L/L^2` residual coefficients instead of treating all twelve
 bases as interchangeable evidence. The conditioner uses a separate fixed
-hand-written modality phrase such as `a brain MRI scan` or `a chest X-ray`;
-normal/abnormal anchors still use the repository templates. No LLM is called.
+hand-written modality phrase such as `a brain MRI scan` or `a chest X-ray`.
+Three frozen focal/diffuse/structural text prototypes are compared with the
+normal anchor using independent sigmoid compatibility scores. A shared zero-
+initialized `3x2` matrix adds global image-specific semantic corrections to the
+bounded `L/L^2` coefficient logits. No online LLM is called.
 
-The final CLS/local readout is fixed. V4.1 trains only 9,228 parameters for
+The final CLS/local readout is fixed. V4.2-SSC trains only 9,234 parameters for
 ViT-L/14 and uses Image BCE plus valid-mask Pixel Focal/Dice; it does not use
 the V3 Haar, graph head, lesion gate, band intervention, Top-k, or GeM modules.
 Both training batch files expose `--pixel_loss_weight`, so the Pixel Loss
@@ -153,10 +156,11 @@ train_v4_lodo.bat Chest
 test_v4_lodo.bat Chest
 ```
 
-See [V4_METHOD.md](V4_METHOD.md) for the exact Laplacian, fusion equation,
-mixed-supervision routing, and checkpoint contract. V4.1 checkpoints are stored
-under `ckpt/v4_1_graph_spectral` or `ckpt/v4_1_bmad_lodo/<TARGET>` and cannot be
-mixed with old V4 or V3 checkpoints.
+See [V4_2_TEXT_SPECTRAL_COUPLING.md](V4_2_TEXT_SPECTRAL_COUPLING.md) for the
+semantic compatibility, coupling equation, mixed-supervision routing, and
+checkpoint contract. V4.2-SSC checkpoints are stored under `ckpt/v4_2_ssc` or
+`ckpt/v4_2_ssc_bmad_lodo/<TARGET>` and cannot be mixed with V4.1, V3, or older
+checkpoints.
 
 For a paired medical case study against the original AA-CLIP, run:
 

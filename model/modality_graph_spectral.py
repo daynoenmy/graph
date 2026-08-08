@@ -85,31 +85,37 @@ class FixedGraphLaplacian(nn.Module):
 
 
 class ModalityConditionedSpectralFusion(nn.Module):
-    """Preserve semantic margins and add bounded signed spectral residuals."""
+    """Add bounded modality- and aspect-conditioned spectral residuals."""
 
     def __init__(
         self,
         embedding_dim,
         num_layers,
         num_orders=3,
+        num_aspects=3,
         minimum_uniform_mass=0.2,
         max_spectral_coefficient=1.0,
+        aspect_coupling_strength=1.0,
     ):
         super().__init__()
-        if embedding_dim < 1 or num_layers < 1 or num_orders < 2:
+        if embedding_dim < 1 or num_layers < 1 or num_orders < 2 or num_aspects < 1:
             raise ValueError(
-                "embedding_dim/layer counts must be positive and num_orders "
-                "must include at least one residual order"
+                "embedding_dim/layer/aspect counts must be positive and "
+                "num_orders must include at least one residual order"
             )
         if not 0 <= minimum_uniform_mass < 1:
             raise ValueError("minimum_uniform_mass must lie in [0, 1)")
         if max_spectral_coefficient <= 0:
             raise ValueError("max_spectral_coefficient must be positive")
+        if aspect_coupling_strength < 0:
+            raise ValueError("aspect_coupling_strength must be non-negative")
         self.embedding_dim = int(embedding_dim)
         self.num_layers = int(num_layers)
         self.num_orders = int(num_orders)
+        self.num_aspects = int(num_aspects)
         self.minimum_uniform_mass = float(minimum_uniform_mass)
         self.max_spectral_coefficient = float(max_spectral_coefficient)
+        self.aspect_coupling_strength = float(aspect_coupling_strength)
         self.layer_conditioner = nn.Linear(
             self.embedding_dim,
             self.num_layers,
@@ -118,8 +124,14 @@ class ModalityConditionedSpectralFusion(nn.Module):
             self.embedding_dim,
             self.num_layers * (self.num_orders - 1),
         )
-        # V4.1 starts from the uniform four-layer CLIP semantic baseline.
-        # Laplacian corrections are exactly zero before optimization.
+        # A shared 3x2 matrix learns how image-level semantic compatibility
+        # modifies L/L2 residual logits. It is deliberately shared across
+        # layers and datasets to keep the coupling small and transferable.
+        self.aspect_coupling = nn.Parameter(
+            torch.zeros(self.num_aspects, self.num_orders - 1)
+        )
+        # V4.2-SSC starts from the uniform multi-layer CLIP semantic baseline.
+        # Both modality and aspect corrections are exactly zero initially.
         for conditioner in (self.layer_conditioner, self.residual_conditioner):
             nn.init.zeros_(conditioner.weight)
             nn.init.zeros_(conditioner.bias)
@@ -145,7 +157,29 @@ class ModalityConditionedSpectralFusion(nn.Module):
             raise ValueError("modality_embeddings must have shape [D] or [B, D]")
         return F.normalize(modality, dim=-1)
 
-    def conditioning_parameters(self, modality_embeddings, batch_size):
+    def _validate_aspect_compatibilities(
+        self,
+        aspect_compatibilities,
+        batch_size,
+        device,
+        dtype,
+    ):
+        if aspect_compatibilities is None:
+            return None
+        expected = (batch_size, self.num_aspects)
+        if tuple(aspect_compatibilities.shape) != expected:
+            raise ValueError(
+                f"aspect_compatibilities must have shape {expected}, "
+                f"got {tuple(aspect_compatibilities.shape)}"
+            )
+        return aspect_compatibilities.to(device=device, dtype=dtype)
+
+    def conditioning_parameters(
+        self,
+        modality_embeddings,
+        batch_size,
+        aspect_compatibilities=None,
+    ):
         modality = self._validate_modality_embedding(
             modality_embeddings,
             batch_size,
@@ -155,17 +189,41 @@ class ModalityConditionedSpectralFusion(nn.Module):
         layer_weights = (
             layer_weights + (1.0 - self.minimum_uniform_mass) * learned_layers
         )
-        residual_coefficients = self.max_spectral_coefficient * torch.tanh(
-            self.residual_conditioner(modality)
-        )
-        residual_coefficients = residual_coefficients.view(
+        residual_logits = self.residual_conditioner(modality).view(
             batch_size,
             self.num_layers,
             self.num_orders - 1,
         )
-        return layer_weights, residual_coefficients
+        aspect_compatibilities = self._validate_aspect_compatibilities(
+            aspect_compatibilities,
+            batch_size,
+            residual_logits.device,
+            residual_logits.dtype,
+        )
+        coupling_logits = residual_logits.new_zeros(
+            batch_size,
+            self.num_orders - 1,
+        )
+        if aspect_compatibilities is not None:
+            # Independent sigmoid compatibilities use 0.5 as their neutral
+            # point. Centering prevents a uniformly ambiguous image from
+            # introducing a systematic residual bias.
+            centered_compatibilities = aspect_compatibilities - 0.5
+            coupling_logits = centered_compatibilities @ self.aspect_coupling
+            residual_logits = residual_logits + self.aspect_coupling_strength * (
+                coupling_logits.unsqueeze(1)
+            )
+        residual_coefficients = self.max_spectral_coefficient * torch.tanh(
+            residual_logits
+        )
+        return layer_weights, residual_coefficients, coupling_logits
 
-    def forward(self, spectral_bases, modality_embeddings):
+    def forward(
+        self,
+        spectral_bases,
+        modality_embeddings,
+        aspect_compatibilities,
+    ):
         if spectral_bases.ndim != 6:
             raise ValueError("spectral_bases must have shape [B, L, K, 1, H, W]")
         batch_size, num_layers, num_orders = spectral_bases.shape[:3]
@@ -173,9 +231,14 @@ class ModalityConditionedSpectralFusion(nn.Module):
             raise ValueError(
                 "spectral_bases layer/order dimensions do not match the fusion"
             )
-        layer_weights, residual_coefficients = self.conditioning_parameters(
+        (
+            layer_weights,
+            residual_coefficients,
+            coupling_logits,
+        ) = self.conditioning_parameters(
             modality_embeddings,
             batch_size,
+            aspect_compatibilities,
         )
         layer_weights = layer_weights.to(dtype=spectral_bases.dtype)
         residual_coefficients = residual_coefficients.to(dtype=spectral_bases.dtype)
@@ -195,11 +258,11 @@ class ModalityConditionedSpectralFusion(nn.Module):
         fused = (
             corrected_layers * layer_weights.view(batch_size, num_layers, 1, 1, 1)
         ).sum(dim=1)
-        return fused, layer_weights, residual_coefficients
+        return fused, layer_weights, residual_coefficients, coupling_logits
 
 
 class FrozenModalityGraphSpectralModel(nn.Module):
-    """Four frozen CLIP levels and one modality-conditioned spectral operator."""
+    """Frozen CLIP with modality- and semantic-aspect spectral conditioning."""
 
     def __init__(
         self,
@@ -209,6 +272,8 @@ class FrozenModalityGraphSpectralModel(nn.Module):
         laplacian_temperature=0.2,
         spectral_uniform_mass=0.2,
         max_spectral_coefficient=1.0,
+        aspect_temperature=10.0,
+        aspect_coupling_strength=1.0,
         readout_temperature=1.0,
     ):
         super().__init__()
@@ -219,8 +284,8 @@ class FrozenModalityGraphSpectralModel(nn.Module):
             raise ValueError("feature_layers must not contain duplicates")
         if tuple(sorted(feature_layers)) != feature_layers:
             raise ValueError("feature_layers must be strictly increasing")
-        if text_temperature <= 0 or readout_temperature <= 0:
-            raise ValueError("text/readout temperatures must be positive")
+        if min(text_temperature, aspect_temperature, readout_temperature) <= 0:
+            raise ValueError("text/aspect/readout temperatures must be positive")
         available_layers = len(clip_model.visual.transformer.resblocks)
         if max(feature_layers) > available_layers:
             raise ValueError(
@@ -231,7 +296,9 @@ class FrozenModalityGraphSpectralModel(nn.Module):
         self.clip_model = clip_model
         self.feature_layers = feature_layers
         self.text_temperature = float(text_temperature)
+        self.aspect_temperature = float(aspect_temperature)
         self.readout_temperature = float(readout_temperature)
+        self.aspect_names = ("focal", "diffuse", "structural")
         embedding_dim = int(clip_model.visual.proj.shape[1])
         self.embedding_dim = embedding_dim
         self.laplacian = FixedGraphLaplacian(laplacian_temperature)
@@ -239,8 +306,10 @@ class FrozenModalityGraphSpectralModel(nn.Module):
             embedding_dim=embedding_dim,
             num_layers=len(feature_layers),
             num_orders=3,
+            num_aspects=len(self.aspect_names),
             minimum_uniform_mass=spectral_uniform_mass,
             max_spectral_coefficient=max_spectral_coefficient,
+            aspect_coupling_strength=aspect_coupling_strength,
         )
 
         for parameter in self.clip_model.parameters():
@@ -303,6 +372,64 @@ class FrozenModalityGraphSpectralModel(nn.Module):
             raise ValueError("text_embeddings must have shape [D, 2] or [B, D, 2]")
         return self.text_temperature * (logits[..., 1] - logits[..., 0])
 
+    def _aspect_compatibilities(
+        self,
+        global_features,
+        text_embeddings,
+        aspect_embeddings,
+    ):
+        batch_size = global_features.shape[0]
+        num_aspects = len(self.aspect_names)
+        if aspect_embeddings.ndim == 2:
+            expected = (self.embedding_dim, num_aspects)
+            if tuple(aspect_embeddings.shape) != expected:
+                raise ValueError(
+                    f"aspect_embeddings must have shape {expected}, "
+                    f"got {tuple(aspect_embeddings.shape)}"
+                )
+            normalized_aspects = F.normalize(aspect_embeddings, dim=0)
+            aspect_scores = global_features @ normalized_aspects
+        elif aspect_embeddings.ndim == 3:
+            expected = (batch_size, self.embedding_dim, num_aspects)
+            if tuple(aspect_embeddings.shape) != expected:
+                raise ValueError(
+                    f"aspect_embeddings must have shape {expected}, "
+                    f"got {tuple(aspect_embeddings.shape)}"
+                )
+            normalized_aspects = F.normalize(aspect_embeddings, dim=1)
+            aspect_scores = torch.matmul(
+                global_features.unsqueeze(1),
+                normalized_aspects,
+            ).squeeze(1)
+        else:
+            raise ValueError(
+                "aspect_embeddings must have shape [D, A] or [B, D, A]"
+            )
+
+        if text_embeddings.ndim == 2:
+            expected = (self.embedding_dim, 2)
+            if tuple(text_embeddings.shape) != expected:
+                raise ValueError(
+                    f"text_embeddings must have shape {expected}, "
+                    f"got {tuple(text_embeddings.shape)}"
+                )
+            normal_anchor = F.normalize(text_embeddings[:, 0], dim=0)
+            normal_scores = global_features @ normal_anchor
+        elif text_embeddings.ndim == 3:
+            expected = (batch_size, self.embedding_dim, 2)
+            if tuple(text_embeddings.shape) != expected:
+                raise ValueError(
+                    f"text_embeddings must have shape {expected}, "
+                    f"got {tuple(text_embeddings.shape)}"
+                )
+            normal_anchors = F.normalize(text_embeddings[:, :, 0], dim=1)
+            normal_scores = (global_features * normal_anchors).sum(dim=-1)
+        else:
+            raise ValueError("text_embeddings must have shape [D, 2] or [B, D, 2]")
+
+        relative_scores = aspect_scores - normal_scores.unsqueeze(-1)
+        return torch.sigmoid(self.aspect_temperature * relative_scores)
+
     def _spectral_bases(self, patch_levels, text_embeddings):
         bases = []
         grid_shape = None
@@ -342,14 +469,26 @@ class FrozenModalityGraphSpectralModel(nn.Module):
         image,
         text_embeddings,
         modality_embeddings,
+        aspect_embeddings,
         return_image_logits=False,
         return_aux=False,
     ):
         global_features, patch_levels = self.encode_image(image)
+        aspect_compatibilities = self._aspect_compatibilities(
+            global_features,
+            text_embeddings,
+            aspect_embeddings,
+        )
         spectral_bases = self._spectral_bases(patch_levels, text_embeddings)
-        patch_logits, layer_weights, residual_coefficients = self.spectral_fusion(
+        (
+            patch_logits,
+            layer_weights,
+            residual_coefficients,
+            coupling_logits,
+        ) = self.spectral_fusion(
             spectral_bases,
             modality_embeddings,
+            aspect_compatibilities,
         )
         image_logits = cls_logits = local_logits = None
         if return_image_logits or return_aux:
@@ -363,6 +502,8 @@ class FrozenModalityGraphSpectralModel(nn.Module):
             auxiliary = {
                 "layer_weights": layer_weights,
                 "residual_coefficients": residual_coefficients,
+                "aspect_compatibilities": aspect_compatibilities,
+                "coupling_logits": coupling_logits,
                 "spectral_bases": spectral_bases,
                 "cls_logits": cls_logits,
                 "local_logits": local_logits,
@@ -388,16 +529,21 @@ class FrozenModalityGraphSpectralModel(nn.Module):
         )
 
     @torch.no_grad()
-    def conditioning_state(self, modality_embeddings):
-        layer_weights, residual_coefficients = (
+    def conditioning_state(self, modality_embeddings, aspect_compatibilities=None):
+        layer_weights, residual_coefficients, coupling_logits = (
             self.spectral_fusion.conditioning_parameters(
                 modality_embeddings,
                 batch_size=1,
+                aspect_compatibilities=aspect_compatibilities,
             )
         )
         return {
             "layer_weights": layer_weights[0].detach().cpu().tolist(),
             "residual_coefficients": (residual_coefficients[0].detach().cpu().tolist()),
+            "coupling_logits": coupling_logits[0].detach().cpu().tolist(),
+            "aspect_coupling": self.spectral_fusion.aspect_coupling.detach()
+            .cpu()
+            .tolist(),
         }
 
     def architecture_config(self):
@@ -406,10 +552,19 @@ class FrozenModalityGraphSpectralModel(nn.Module):
             "spectral_orders": [0, 1, 2],
             "laplacian_graph": "four_neighbor_feature_affinity_random_walk",
             "laplacian_temperature": self.laplacian.affinity_temperature,
-            "spectral_fusion": "modality_conditioned_bounded_signed_residual",
+            "spectral_fusion": (
+                "modality_and_semantic_aspect_conditioned_bounded_residual"
+            ),
             "spectral_uniform_mass": (self.spectral_fusion.minimum_uniform_mass),
             "max_spectral_coefficient": (self.spectral_fusion.max_spectral_coefficient),
             "modality_conditioning": "fixed_template_v1",
+            "aspect_conditioning": "normal_relative_independent_sigmoid",
+            "aspect_names": list(self.aspect_names),
+            "aspect_temperature": self.aspect_temperature,
+            "aspect_coupling": "shared_centered_3x2_additive_logits",
+            "aspect_coupling_strength": (
+                self.spectral_fusion.aspect_coupling_strength
+            ),
             "image_readout": "fixed_attention_cls_mean",
             "readout_temperature": self.readout_temperature,
             "image_cls_weight": 0.5,
