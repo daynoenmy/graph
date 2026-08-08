@@ -156,6 +156,14 @@ train_v4_lodo.bat Chest
 test_v4_lodo.bat Chest
 ```
 
+For the `Chest` fold, these two scripts apply the same conservative X-ray
+preset: Laplacian temperature `0.15`, uniform layer mass `0.35`, maximum
+spectral coefficient `0.75`, aspect temperature `7.5`, readout temperature
+`1.5`, and source-domain Pixel Loss weight `0.5`. The preset uses only the
+known target modality/mask-availability protocol, not Chest images or test
+metrics. Report it as a target-specific preset rather than a single shared-
+hyperparameter six-fold LODO result.
+
 See [V4_2_TEXT_SPECTRAL_COUPLING.md](V4_2_TEXT_SPECTRAL_COUPLING.md) for the
 semantic compatibility, coupling equation, mixed-supervision routing, and
 checkpoint contract. V4.2-SSC checkpoints are stored under `ckpt/v4_2_ssc` or
