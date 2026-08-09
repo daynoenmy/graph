@@ -54,24 +54,18 @@ AA-CLIP adapters on the other five. The CLIP model, adapter placement, four
 feature levels (`6, 12, 18, 24`), and optimizer parameter groups are unchanged.
 
 Place each metadata file at
-`dataset/metadata/<dataset>/full-shot.jsonl`. Dataset roots already present in
-`dataset/constants.py` are reused; pass `--data_path DATASET=/absolute/path` for
-new datasets.
+`dataset/metadata/<dataset>/full-shot.jsonl` and set every dataset root directly
+in `dataset/constants.py`.
 
 ```bash
 python train.py \
   --leave_out Chest \
   --datasets Chest Liver Brain OCT2017 RESC HIS \
   --training_mode full_shot \
-  --data_path Chest=/data/Chest \
-  --data_path OCT2017=/data/OCT2017 \
-  --data_path RESC=/data/RESC \
-  --data_path HIS=/data/HIS \
   --save_path ckpt/leave_one_out/leave_out_Chest
 
 python test.py \
   --dataset Chest \
-  --data_path Chest=/data/Chest \
   --save_path ckpt/leave_one_out/leave_out_Chest
 ```
 

@@ -1,7 +1,11 @@
 BASE_PATH = "/home/sunhan"
 DATA_PATH = {
+    "Chest": f"{BASE_PATH}/data/MedAD/Chest",
     "Brain": f"{BASE_PATH}/dataset/Brain_AD",
     "Liver": f"{BASE_PATH}/dataset/Liver_AD",
+    "OCT2017": f"{BASE_PATH}/data/MedAD/OCT2017",
+    "RESC": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
+    "HIS": f"{BASE_PATH}/data/MedAD/HIS",
     "Retina": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
     "Colon_clinicDB": f"{BASE_PATH}/data/Colon/CVC-ClinicDB",
     "Colon_colonDB": f"{BASE_PATH}/data/Colon/CVC-ColonDB",
@@ -14,8 +18,12 @@ DATA_PATH = {
 }
 
 CLASS_NAMES = {
+    "Chest": ["Chest"],
     "Brain": ["Brain"],
     "Liver": ["Liver"],
+    "OCT2017": ["OCT2017"],
+    "RESC": ["RESC"],
+    "HIS": ["HIS"],
     "Retina": ["Retina"],
     "Colon_clinicDB": ["Colon_clinicDB"],
     "Colon_colonDB": ["Colon_colonDB"],
@@ -67,8 +75,12 @@ DOMAINS = {
     "BTAD": "Industrial",
     "MPDD": "Industrial",
     "MVTec": "Industrial",
+    "Chest": "Medical",
     "Brain": "Medical",
     "Liver": "Medical",
+    "OCT2017": "Medical",
+    "RESC": "Medical",
+    "HIS": "Medical",
     "Retina": "Medical",
     "Colon_clinicDB": "Medical",
     "Colon_colonDB": "Medical",
@@ -76,8 +88,12 @@ DOMAINS = {
     "Colon_cvc300": "Medical",
 }
 REAL_NAMES = {
+    "Chest": {"Chest": "chest X-ray"},
     "Brain": {"Brain": "scan"},
     "Liver": {"Liver": "scan"},
+    "OCT2017": {"OCT2017": "retinal OCT image"},
+    "RESC": {"RESC": "retinal OCT image"},
+    "HIS": {"HIS": "histopathology image"},
     "Retina": {"Retina": "scan"},
     "MVTec": {
         "bottle": "dark bottle",
