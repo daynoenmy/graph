@@ -248,11 +248,7 @@ def metrics_eval(
             image_preds.max() - image_preds.min()
         )
 
-    pmax_pred = pixel_preds.max(axis=(1, 2))
-    if domain != "Medical":
-        image_preds = pmax_pred * 0.5 + image_preds * 0.5
-    else:
-        image_preds = pmax_pred
+    # Image-level metrics use the det_feature classification score directly.
     # ================================================================================================
     # pixel level auc & ap (only where pixel ground truth is available)
     if pixel_validity is not None:
