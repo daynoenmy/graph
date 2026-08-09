@@ -274,7 +274,7 @@ def main():
         "--maskless_datasets",
         type=str,
         nargs="*",
-        default=["Chest", "HIS"],
+        default=["Chest", "OCT2017", "HIS"],
         help="datasets without pixel masks; they use image-level loss only",
     )
     parser.add_argument(

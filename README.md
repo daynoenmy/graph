@@ -72,11 +72,11 @@ python test.py \
 Repeat with each of `Chest`, `Liver`, `Brain`, `OCT2017`, `RESC`, and `HIS` as
 `--leave_out`, using a separate checkpoint directory for every fold.
 
-`Chest` and `HIS` are treated as maskless datasets by default. When they are
-training sources, they contribute only to the image-level classification loss;
-they are excluded from text-stage and patch-level segmentation losses. When
-held out for testing, image AUC/AP use the patch-maximum score and pixel AUC/AP
-are `NaN`.
+`Chest`, `OCT2017`, and `HIS` are treated as maskless datasets by default. When
+they are training sources, they contribute only to the image-level
+classification loss; they are excluded from text-stage and patch-level
+segmentation losses. When held out for testing, image AUC/AP use the
+patch-maximum score and pixel AUC/AP are `NaN`.
 Override the default when necessary with `--maskless_datasets`.
 
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.

@@ -130,7 +130,7 @@ def main():
         "--maskless_datasets",
         type=str,
         nargs="*",
-        default=["Chest", "HIS"],
+        default=["Chest", "OCT2017", "HIS"],
         help="datasets without pixel-level ground truth",
     )
     parser.add_argument("--shot", type=int, default=4)
