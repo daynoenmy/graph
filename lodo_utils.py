@@ -1,6 +1,7 @@
 import json
 import os
 
+import torch
 from torch.utils.data import Dataset
 
 from dataset.constants import CLASS_NAMES, DATA_PATH, DOMAINS, REAL_NAMES
@@ -29,7 +30,7 @@ class DatasetWithName(Dataset):
         sample = dict(self.dataset[index])
         sample["dataset_name"] = self.dataset_name
         if not self.has_pixel_masks:
-            sample["has_mask"] = False
+            sample["has_mask"] = torch.tensor(False, dtype=torch.bool)
         return sample
 
 
