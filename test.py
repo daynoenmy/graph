@@ -15,6 +15,7 @@ from utils import setup_seed, cos_sim
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
 from dataset import get_dataset, DOMAINS
+from lodo_utils import DatasetWithName, configure_lodo_datasets
 from forward_utils import (
     get_adapted_text_embedding,
     calculate_similarity_map,
@@ -62,16 +63,21 @@ def get_predictions(
     labels = []
     preds = []
     preds_image = []
+    mask_validity = []
     file_names = []
     for input_data in tqdm(test_loader):
         image = input_data["image"].to(device)
         mask = input_data["mask"].cpu().numpy()
         label = input_data["label"].cpu().numpy()
+        has_mask = input_data.get("has_mask")
+        if has_mask is None:
+            has_mask = torch.ones(len(label), dtype=torch.bool)
         file_name = input_data["file_name"]
         # set up class-specific containers
         class_name = input_data["class_name"]
         assert len(set(class_name)) == 1, "mixed class not supported"
         masks.append(mask)
+        mask_validity.append(has_mask.cpu().numpy().astype(bool))
         labels.append(label)
         file_names.extend(file_name)
         # get text
@@ -96,7 +102,8 @@ def get_predictions(
     labels = np.concatenate(labels, axis=0)
     preds = np.concatenate(preds, axis=0)
     preds_image = np.concatenate(preds_image, axis=0)
-    return masks, labels, preds, preds_image, file_names
+    mask_validity = np.concatenate(mask_validity, axis=0)
+    return masks, labels, preds, preds_image, mask_validity, file_names
 
 
 def main():
@@ -112,11 +119,31 @@ def main():
     parser.add_argument("--relu", action="store_true")
     # testing
     parser.add_argument("--dataset", type=str, default="MVTec")
+    parser.add_argument(
+        "--data_path",
+        action="append",
+        default=[],
+        metavar="DATASET=PATH",
+        help="override the test dataset root",
+    )
+    parser.add_argument(
+        "--maskless_datasets",
+        type=str,
+        nargs="*",
+        default=["Chest", "HIS"],
+        help="datasets without pixel-level ground truth",
+    )
     parser.add_argument("--shot", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="image_adapter.pth",
+        help="image-adapter checkpoint name or absolute path",
+    )
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--text_norm_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_weight", type=float, default=0.1)
@@ -130,6 +157,10 @@ def main():
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
+    try:
+        configure_lodo_datasets([args.dataset], args.data_path)
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -170,93 +201,123 @@ def main():
     ).to(device)
     model.eval()
     # load checkpoints if exists
+    checkpoint_file = args.checkpoint
+    if not os.path.isabs(checkpoint_file):
+        checkpoint_file = os.path.join(args.save_path, checkpoint_file)
+    if not os.path.isfile(checkpoint_file):
+        raise FileNotFoundError(f"image adapter checkpoint not found: {checkpoint_file}")
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    training_setup = checkpoint.get("training_setup")
+    if training_setup and training_setup.get("mode") == "leave_one_out":
+        held_out_dataset = training_setup.get("held_out_dataset")
+        if held_out_dataset != args.dataset:
+            raise ValueError(
+                f"Checkpoint held out {held_out_dataset!r}, but test dataset is "
+                f"{args.dataset!r}"
+            )
+    model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
+    test_epoch = checkpoint["epoch"]
+
     text_file = glob(args.save_path + "/text_adapter.pth")
-    assert len(text_file) >= 0, "text adapter checkpoint not found"
     if len(text_file) > 0:
-        checkpoint = torch.load(text_file[0])
-        model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
+        text_checkpoint = torch.load(text_file[0], map_location=device)
+        text_setup = text_checkpoint.get("training_setup")
+        if (
+            training_setup
+            and training_setup.get("mode") == "leave_one_out"
+            and text_setup != training_setup
+        ):
+            raise ValueError("Text and image checkpoints use different training folds")
+        model.text_adapter.load_state_dict(
+            text_checkpoint["text_adapter"], strict=False
+        )
         adapt_text = True
     else:
         adapt_text = False
 
-    files = sorted(glob(args.save_path + "/image_adapter_2.pth"))
-    assert len(files) > 0, "image adapter checkpoint not found"
-    for file in files:
-        checkpoint = torch.load(file)
-        model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
-        test_epoch = checkpoint["epoch"]
-        logger.info("-----------------------------------------------")
-        logger.info("load model from epoch %d", test_epoch)
-        logger.info("-----------------------------------------------")
-        # ========================================================
-        # load dataset
-        kwargs = {"num_workers": 4, "pin_memory": True} if use_cuda else {}
-        image_datasets = get_dataset(
-            args.dataset,
-            args.img_size,
-            None,
-            args.shot,
-            "test",
-            logger=logger,
-        )
-        with torch.no_grad():
-            if adapt_text:
-                text_embeddings = get_adapted_text_embedding(
-                    model, args.dataset, device
-                )
-            else:
-                text_embeddings = get_adapted_text_embedding(
-                    model, args.dataset, device, adapt_text=False
-                )
-        # ========================================================
-        df = DataFrame(
-            columns=[
-                "class name",
-                "pixel AUC",
-                "pixel AP",
-                "image AUC",
-                "image AP",
-            ]
-        )
-        for class_name, image_dataset in image_datasets.items():
-            image_dataloader = torch.utils.data.DataLoader(
-                image_dataset, batch_size=args.batch_size, shuffle=False, **kwargs
+    logger.info("-----------------------------------------------")
+    logger.info("load model from epoch %d", test_epoch)
+    logger.info("training setup: %s", training_setup)
+    logger.info("-----------------------------------------------")
+    # ========================================================
+    # load dataset
+    kwargs = {"num_workers": 4, "pin_memory": True} if use_cuda else {}
+    image_datasets = get_dataset(
+        args.dataset,
+        args.img_size,
+        None,
+        args.shot,
+        "test",
+        logger=logger,
+    )
+    if args.dataset in args.maskless_datasets:
+        image_datasets = {
+            class_name: DatasetWithName(
+                image_dataset,
+                args.dataset,
+                has_pixel_masks=False,
             )
+            for class_name, image_dataset in image_datasets.items()
+        }
+    with torch.no_grad():
+        if adapt_text:
+            text_embeddings = get_adapted_text_embedding(
+                model, args.dataset, device
+            )
+        else:
+            text_embeddings = get_adapted_text_embedding(
+                model, args.dataset, device, adapt_text=False
+            )
+    # ========================================================
+    df = DataFrame(
+        columns=[
+            "class name",
+            "pixel AUC",
+            "pixel AP",
+            "image AUC",
+            "image AP",
+        ]
+    )
+    for class_name, image_dataset in image_datasets.items():
+        image_dataloader = torch.utils.data.DataLoader(
+            image_dataset, batch_size=args.batch_size, shuffle=False, **kwargs
+        )
 
-            # ========================================================
-            # testing
-            with torch.no_grad():
-                class_text_embeddings = text_embeddings[class_name]
-                masks, labels, preds, preds_image, file_names = get_predictions(
-                    model=model,
-                    class_text_embeddings=class_text_embeddings,
-                    test_loader=image_dataloader,
-                    device=device,
-                    img_size=args.img_size,
-                    dataset=args.dataset,
-                )
-            # ========================================================
-            if args.visualize:
-                visualize(
-                    masks,
-                    preds,
-                    file_names,
-                    args.save_path,
-                    args.dataset,
-                    class_name=class_name,
-                )
-            class_result_dict = metrics_eval(
-                masks,
-                labels,
-                preds,
-                preds_image,
-                class_name,
-                domain=DOMAINS[args.dataset],
+        # ========================================================
+        # testing
+        with torch.no_grad():
+            class_text_embeddings = text_embeddings[class_name]
+            masks, labels, preds, preds_image, mask_validity, file_names = get_predictions(
+                model=model,
+                class_text_embeddings=class_text_embeddings,
+                test_loader=image_dataloader,
+                device=device,
+                img_size=args.img_size,
+                dataset=args.dataset,
             )
-            df.loc[len(df)] = Series(class_result_dict)
-        df.loc[len(df)] = df.mean()
-        df.loc[len(df) - 1]["class name"] = "Average"
-        logger.info("final results:\n%s", df.to_string(index=False, justify="center"))
+        # ========================================================
+        if args.visualize:
+            visualize(
+                masks,
+                preds,
+                file_names,
+                args.save_path,
+                args.dataset,
+                class_name=class_name,
+            )
+        class_result_dict = metrics_eval(
+            masks,
+            labels,
+            preds,
+            preds_image,
+            class_name,
+            domain=DOMAINS[args.dataset],
+            pixel_validity=mask_validity,
+        )
+        df.loc[len(df)] = Series(class_result_dict)
+    df.loc[len(df)] = df.mean()
+    df.loc[len(df) - 1, "class name"] = "Average"
+    logger.info("final results:\n%s", df.to_string(index=False, justify="center"))
 
 
 if __name__ == "__main__":

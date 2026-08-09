@@ -7,13 +7,18 @@ from glob import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 
 from utils import setup_seed
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
 from dataset import get_dataset
+from lodo_utils import (
+    DEFAULT_LODO_DATASETS,
+    DatasetWithName,
+    configure_lodo_datasets,
+)
 from forward_utils import (
     get_adapted_text_embedding,
     get_adapted_single_class_text_embedding,
@@ -49,6 +54,7 @@ def train_text_adapter(
     dataset_name: str,
     img_size: int,
     logger: logging.Logger,
+    training_setup: dict = None,
 ):
     for epoch in range(start_epoch, text_epoch):
         logger.info(f"training text epoch {epoch}:")
@@ -58,16 +64,30 @@ def train_text_adapter(
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
             class_names = input_data["class_name"]
+            dataset_names = input_data.get(
+                "dataset_name", [dataset_name] * len(class_names)
+            )
+            has_mask = input_data.get("has_mask")
+            if has_mask is not None:
+                valid_mask = has_mask.to(device=device, dtype=torch.bool)
+                if not valid_mask.any():
+                    continue
+                valid_indices = valid_mask.nonzero(as_tuple=False).flatten().tolist()
+                image = image[valid_mask]
+                mask = mask[valid_mask]
+                class_names = [class_names[index] for index in valid_indices]
+                dataset_names = [dataset_names[index] for index in valid_indices]
 
             # forward text
             epoch_text_feature_dict = {}
-            for class_name in list(set(class_names)):
+            sample_keys = list(zip(dataset_names, class_names))
+            for sample_dataset, class_name in set(sample_keys):
                 text_embedding = get_adapted_single_class_text_embedding(
-                    adapted_model, dataset_name, class_name, device
+                    adapted_model, sample_dataset, class_name, device
                 )
-                epoch_text_feature_dict[class_name] = text_embedding
+                epoch_text_feature_dict[(sample_dataset, class_name)] = text_embedding
             epoch_text_feature = torch.stack(
-                [epoch_text_feature_dict[class_name] for class_name in class_names],
+                [epoch_text_feature_dict[key] for key in sample_keys],
                 dim=0,
             )  # bs,768,2
             # forward image
@@ -109,6 +129,7 @@ def train_text_adapter(
                 "epoch": epoch + 1,
                 "text_adapter": adapted_model.text_adapter.state_dict(),
                 "text_optimizer": optimizer.state_dict(),
+                "training_setup": training_setup,
             },
             ckp_path,
         )
@@ -127,6 +148,8 @@ def train_image_adapter(
     image_epoch: int,
     img_size: int,
     logger: logging.Logger,
+    default_dataset_name: str,
+    training_setup: dict = None,
 ):
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
@@ -138,8 +161,20 @@ def train_image_adapter(
             B, C, H, W = image.shape
             # forward text
             class_names = input_data["class_name"]
+            dataset_names = input_data.get(
+                "dataset_name", [default_dataset_name] * len(class_names)
+            )
+            has_mask = input_data.get("has_mask")
+            if has_mask is None:
+                has_mask = torch.ones(len(class_names), dtype=torch.bool, device=device)
+            else:
+                has_mask = has_mask.to(device=device, dtype=torch.bool)
             epoch_text_feature = torch.stack(
-                [text_embeddings[class_name] for class_name in class_names], dim=0
+                [
+                    text_embeddings[(sample_dataset, class_name)]
+                    for sample_dataset, class_name in zip(dataset_names, class_names)
+                ],
+                dim=0,
             )
 
             # forward image
@@ -149,10 +184,13 @@ def train_image_adapter(
             det_feature = det_feature.unsqueeze(1)
             cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
             loss += F.cross_entropy(cls_preds, label)
-            for f in patch_features:
-                # text-image alignment
-                patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
-                loss += calculate_seg_loss(patch_preds, mask)  # backward
+            if has_mask.any():
+                for f in patch_features:
+                    # text-image alignment for samples with pixel supervision
+                    patch_preds = calculate_similarity_map(
+                        f[has_mask], epoch_text_feature[has_mask], img_size
+                    )
+                    loss += calculate_seg_loss(patch_preds, mask[has_mask])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -164,6 +202,7 @@ def train_image_adapter(
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
+            "training_setup": training_setup,
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -173,6 +212,27 @@ def train_image_adapter(
                 ckp_path,
             )
     return model
+
+
+def get_training_text_embeddings(model, dataset_names, device, adapt_text=True):
+    text_embeddings = {}
+    for dataset_name in dataset_names:
+        dataset_embeddings = get_adapted_text_embedding(
+            model, dataset_name, device, adapt_text=adapt_text
+        )
+        for class_name, embedding in dataset_embeddings.items():
+            text_embeddings[(dataset_name, class_name)] = embedding
+    return text_embeddings
+
+
+def validate_checkpoint_setup(checkpoint, training_setup):
+    saved_setup = checkpoint.get("training_setup")
+    requires_exact_setup = training_setup.get("mode") == "leave_one_out"
+    if (requires_exact_setup or saved_setup is not None) and saved_setup != training_setup:
+        raise ValueError(
+            f"Checkpoint training setup {saved_setup} does not match "
+            f"the requested setup {training_setup}"
+        )
 
 
 def main():
@@ -189,6 +249,34 @@ def main():
     parser.add_argument("--relu", action="store_true", help="use relu after projection")
     # training
     parser.add_argument("--dataset", type=str, default="VisA")
+    parser.add_argument(
+        "--leave_out",
+        type=str,
+        default=None,
+        metavar="DATASET",
+        help="hold out one dataset and train on the others in --datasets",
+    )
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        nargs="+",
+        default=DEFAULT_LODO_DATASETS,
+        help="dataset pool for leave-one-dataset-out training",
+    )
+    parser.add_argument(
+        "--data_path",
+        action="append",
+        default=[],
+        metavar="DATASET=PATH",
+        help="override a dataset root; repeat once per dataset when needed",
+    )
+    parser.add_argument(
+        "--maskless_datasets",
+        type=str,
+        nargs="*",
+        default=["Chest", "HIS"],
+        help="datasets without pixel masks; they use image-level loss only",
+    )
     parser.add_argument(
         "--training_mode",
         type=str,
@@ -221,6 +309,34 @@ def main():
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
+    if args.leave_out is not None:
+        if len(args.datasets) != len(set(args.datasets)):
+            parser.error("--datasets must not contain duplicates")
+        if args.leave_out not in args.datasets:
+            parser.error("--leave_out must be one of --datasets")
+        training_dataset_names = [
+            dataset_name
+            for dataset_name in args.datasets
+            if dataset_name != args.leave_out
+        ]
+        try:
+            configure_lodo_datasets(training_dataset_names, args.data_path)
+        except (FileNotFoundError, ValueError) as error:
+            parser.error(str(error))
+        training_setup = {
+            "mode": "leave_one_out",
+            "held_out_dataset": args.leave_out,
+            "training_datasets": training_dataset_names,
+            "maskless_datasets": args.maskless_datasets,
+        }
+    else:
+        training_dataset_names = [args.dataset]
+        training_setup = {
+            "mode": "single_dataset",
+            "held_out_dataset": None,
+            "training_datasets": training_dataset_names,
+            "maskless_datasets": args.maskless_datasets,
+        }
     # ========================================================
     setup_seed(args.seed)
     # check save_path and setting logger
@@ -288,6 +404,7 @@ def main():
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
         checkpoint = torch.load(text_file[0])
+        validate_checkpoint_setup(checkpoint, training_setup)
         model.text_adapter.load_state_dict(checkpoint["text_adapter"], strict=False)
         try:
             text_optimizer.load_state_dict(checkpoint["text_optimizer"])
@@ -303,6 +420,7 @@ def main():
     file = glob(args.save_path + "/image_adapter.pth")
     if len(file) > 0:
         checkpoint = torch.load(file[0])
+        validate_checkpoint_setup(checkpoint, training_setup)
         image_start_epoch = checkpoint["epoch"]
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         try:
@@ -317,14 +435,57 @@ def main():
         args.shot = -1
     kwargs = {"num_workers": 4, "pin_memory": True} if use_cuda else {}
     logger.info("loading dataset ...")
-    text_dataset, image_dataset = get_dataset(
-        args.dataset,
-        args.img_size,
-        args.training_mode,
-        args.shot,
-        "train",
-        logger,
-    )
+    if args.leave_out is None:
+        text_dataset, image_dataset = get_dataset(
+            args.dataset,
+            args.img_size,
+            args.training_mode,
+            args.shot,
+            "train",
+            logger,
+        )
+        if args.dataset in args.maskless_datasets:
+            text_dataset = DatasetWithName(
+                text_dataset, args.dataset, has_pixel_masks=False
+            )
+            image_dataset = DatasetWithName(
+                image_dataset, args.dataset, has_pixel_masks=False
+            )
+    else:
+        text_datasets = []
+        image_datasets = []
+        for dataset_name in training_dataset_names:
+            source_text_dataset, source_image_dataset = get_dataset(
+                dataset_name,
+                args.img_size,
+                args.training_mode,
+                args.shot,
+                "train",
+                logger,
+            )
+            has_pixel_masks = dataset_name not in args.maskless_datasets
+            text_datasets.append(
+                DatasetWithName(
+                    source_text_dataset,
+                    dataset_name,
+                    has_pixel_masks=has_pixel_masks,
+                )
+            )
+            image_datasets.append(
+                DatasetWithName(
+                    source_image_dataset,
+                    dataset_name,
+                    has_pixel_masks=has_pixel_masks,
+                )
+            )
+            logger.info(
+                "leave-one-out source %s: %d samples",
+                dataset_name,
+                len(source_image_dataset),
+            )
+        text_dataset = ConcatDataset(text_datasets)
+        image_dataset = ConcatDataset(image_datasets)
+        logger.info("leave-one-out held dataset: %s", args.leave_out)
     text_dataloader = torch.utils.data.DataLoader(
         text_dataset, batch_size=args.text_batch_size, shuffle=True, **kwargs
     )
@@ -349,16 +510,17 @@ def main():
             text_epoch=args.text_epoch,
             img_size=args.img_size,
             logger=logger,
+            training_setup=training_setup,
         )
     del text_dataloader, text_dataset, clip_surgery, text_optimizer
     torch.cuda.empty_cache()
     with torch.no_grad():
-        if args.text_epoch == 0:
-            text_embeddings = get_adapted_text_embedding(
-                model, args.dataset, device, adapt_text=False
-            )
-        else:
-            text_embeddings = get_adapted_text_embedding(model, args.dataset, device)
+        text_embeddings = get_training_text_embeddings(
+            model,
+            training_dataset_names,
+            device,
+            adapt_text=args.text_epoch != 0,
+        )
     model = train_image_adapter(
         model=model,
         text_embeddings=text_embeddings,
@@ -371,6 +533,8 @@ def main():
         save_path=args.save_path,
         img_size=args.img_size,
         logger=logger,
+        default_dataset_name=args.dataset,
+        training_setup=training_setup,
     )
 
 

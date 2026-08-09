@@ -78,8 +78,10 @@ class BaseDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
 
         img = self.transform_x(img)
-        if meta["label"]:
-            mask_path = os.path.join(data_path, meta["mask_path"])
+        mask_path = meta.get("mask_path")
+        has_mask = not meta["label"] or bool(mask_path)
+        if meta["label"] and mask_path:
+            mask_path = os.path.join(data_path, mask_path)
             mask = Image.open(mask_path).convert("L")
             mask = self.transform_mask(mask)
             mask = (mask != 0).float()
@@ -99,6 +101,7 @@ class BaseDataset(Dataset):
             "label": torch.tensor(meta["label"]).to(torch.int64),
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
+            "has_mask": torch.tensor(has_mask, dtype=torch.bool),
         }
         return inputs
 
@@ -155,8 +158,10 @@ class BaseSingleClassDataset(Dataset):
         img_path = os.path.join(self.data_path, meta["image_path"])
         img = Image.open(img_path).convert("RGB")
         img = self.transform_x(img)
-        if meta["label"]:
-            mask_path = os.path.join(self.data_path, meta["mask_path"])
+        mask_path = meta.get("mask_path")
+        has_mask = not meta["label"] or bool(mask_path)
+        if meta["label"] and mask_path:
+            mask_path = os.path.join(self.data_path, mask_path)
             mask = Image.open(mask_path).convert("L")
             mask = self.transform_mask(mask)
             mask = (mask != 0).float()
@@ -168,6 +173,7 @@ class BaseSingleClassDataset(Dataset):
             "label": meta["label"],
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
+            "has_mask": torch.tensor(has_mask, dtype=torch.bool),
         }
         return inputs
 

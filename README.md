@@ -47,19 +47,44 @@ python test.py --save_path $save_path --dataset $dataset
 bash scripts.sh
 ```
 
-### Medical zero-shot architecture extension
+### Leave-one-dataset-out training
 
-This fork adds a CP-CLIP inspired core-periphery alignment head and a feature-disentanglement head on top of AA-CLIP adapters. They are enabled by default in `train.py` and `test.py`. Use the same CP/disentanglement arguments for training and evaluation when overriding defaults.
+The training entry point can hold out one medical dataset and train the existing
+AA-CLIP adapters on the other five. The CLIP model, adapter placement, four
+feature levels (`6, 12, 18, 24`), and optimizer parameter groups are unchanged.
+
+Place each metadata file at
+`dataset/metadata/<dataset>/full-shot.jsonl`. Dataset roots already present in
+`dataset/constants.py` are reused; pass `--data_path DATASET=/absolute/path` for
+new datasets.
 
 ```bash
-python train.py --dataset Brain --shot 32 --save_path ckpt/medical_cp_fd \
-  --cp_core_ratio 0.7 --cp_layers 2 --disentangle_weight 0.1
+python train.py \
+  --leave_out Chest \
+  --datasets Chest Liver Brain OCT2017 RESC HIS \
+  --training_mode full_shot \
+  --data_path Chest=/data/Chest \
+  --data_path OCT2017=/data/OCT2017 \
+  --data_path RESC=/data/RESC \
+  --data_path HIS=/data/HIS \
+  --save_path ckpt/leave_one_out/leave_out_Chest
 
-python test.py --dataset Brain --save_path ckpt/medical_cp_fd \
-  --cp_core_ratio 0.7 --cp_layers 2
+python test.py \
+  --dataset Chest \
+  --data_path Chest=/data/Chest \
+  --save_path ckpt/leave_one_out/leave_out_Chest
 ```
 
-To recover the original AA-CLIP adapter behavior, pass `--disable_cp --disable_disentangle`.
+Repeat with each of `Chest`, `Liver`, `Brain`, `OCT2017`, `RESC`, and `HIS` as
+`--leave_out`, using a separate checkpoint directory for every fold.
+
+`Chest` and `HIS` are treated as maskless datasets by default. When they are
+training sources, they contribute only to the image-level classification loss;
+they are excluded from text-stage and patch-level segmentation losses. When
+held out for testing, image AUC/AP use the patch-maximum score and pixel AUC/AP
+are `NaN`.
+Override the default when necessary with `--maskless_datasets`.
+
 Model definition is in ``./model/``. We thank [```open_clip```](https://github.com/mlfoundations/open_clip.git) for being open-source. To run the code, one has to download the weight of OpenCLIP ViT-L-14-336px and put it under ```./model/```.
 
 ## Additional Discussion

@@ -237,6 +237,7 @@ def metrics_eval(
     image_preds: np.ndarray,
     class_names: str,
     domain: str,
+    pixel_validity: np.ndarray = None,
 ):
     if pixel_preds.max() != 1:
         pixel_preds = (pixel_preds - pixel_preds.min()) / (
@@ -253,12 +254,20 @@ def metrics_eval(
     else:
         image_preds = pmax_pred
     # ================================================================================================
-    # pixel level auc & ap
+    # pixel level auc & ap (only where pixel ground truth is available)
+    if pixel_validity is not None:
+        pixel_validity = np.asarray(pixel_validity, dtype=bool)
+        pixel_label = pixel_label[pixel_validity]
+        pixel_preds = pixel_preds[pixel_validity]
     pixel_label = pixel_label.flatten()
     pixel_preds = pixel_preds.flatten()
 
-    zero_pixel_auc = roc_auc_score(pixel_label, pixel_preds)
-    zero_pixel_ap = average_precision_score(pixel_label, pixel_preds)
+    if pixel_label.size == 0 or pixel_label.max() == pixel_label.min():
+        zero_pixel_auc = np.nan
+        zero_pixel_ap = np.nan
+    else:
+        zero_pixel_auc = roc_auc_score(pixel_label, pixel_preds)
+        zero_pixel_ap = average_precision_score(pixel_label, pixel_preds)
     # ================================================================================================
     # image level auc & ap
     if image_label.max() != image_label.min():
