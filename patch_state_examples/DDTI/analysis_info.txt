@@ -1,0 +1,37 @@
+V1 patch-state visualization
+dataset: DDTI
+class: DDTI
+file: test/Ungood/10034.PNG
+dataset index: 20
+image label: 1
+image checkpoint: ckpt\noise_graph\image_adapter_1.pth
+checkpoint epoch: 1
+text checkpoint: ckpt\noise_graph\text_adapter.pth
+feature level: 3 of 4
+patch grid: 37 x 37
+noise model: ultrasound
+noise severity: 0.06
+noise seed: 1607537765
+threshold mode: adaptive
+uncertainty threshold: 0.08967679738998413
+anomaly threshold: 0.4667286276817322
+disagreement threshold: 0.04218381643295288
+learned noise gate scale (softplus): 1.389904
+learned anomaly gate scale (softplus): 1.302495
+learned gate bias: -1.370537
+patch graph k: 8
+patch graph alpha: 0.7
+feature temperature: 0.2
+anomaly temperature: 0.2
+
+State rules used only for this visualization:
+stable_normal: U below threshold and A below threshold.
+noise_sensitive_normal: U high, A low, and D below threshold.
+lesion_candidate_preserved: A above threshold (regardless of U).
+pseudo_anomaly_risk: U high, A below threshold, and D high.
+
+V1 itself uses continuous U and A; it does not predict these four hard labels.
+Adaptive thresholds are per-case quantiles and must not be presented as learned thresholds.
+Ground truth is shown and exported only for post-hoc diagnosis; it never enters inference.
+Source-weight maps are exact rows of the V1 graph transition matrix before projection.
+Update gate g controls how strongly each receiver uses the projected graph feature.

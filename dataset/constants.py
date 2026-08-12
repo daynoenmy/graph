@@ -1,11 +1,11 @@
-BASE_PATH = "/home/sunhan"
+BASE_PATH = "E:\\datasets\\bmad\\BMAD"
 DATA_PATH = {
-    "Chest": f"{BASE_PATH}/data/MedAD/Chest",
-    "Brain": f"{BASE_PATH}/dataset/Brain_AD",
-    "Liver": f"{BASE_PATH}/dataset/Liver_AD",
-    "OCT2017": f"{BASE_PATH}/data/MedAD/OCT2017",
-    "RESC": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
-    "HIS": f"{BASE_PATH}/data/MedAD/HIS",
+    "Chest": f"{BASE_PATH}\\Chest",
+    "Brain": f"{BASE_PATH}\\Brain",
+    "Liver": f"{BASE_PATH}\\Liver",
+    "OCT2017": f"{BASE_PATH}\\OCT2017",
+    "RESC": f"{BASE_PATH}\\RESC",
+    "HIS": f"{BASE_PATH}\\HIS",
     "Retina": f"{BASE_PATH}/data/MedAD/Retina_RESC_AD",
     "Colon_clinicDB": f"{BASE_PATH}/data/Colon/CVC-ClinicDB",
     "Colon_colonDB": f"{BASE_PATH}/data/Colon/CVC-ColonDB",

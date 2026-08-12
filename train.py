@@ -185,12 +185,12 @@ def train_image_adapter(
             cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
             loss += F.cross_entropy(cls_preds, label)
             if has_mask.any():
-                for f in patch_features:
-                    # text-image alignment for samples with pixel supervision
-                    patch_preds = calculate_similarity_map(
-                        f[has_mask], epoch_text_feature[has_mask], img_size
-                    )
-                    loss += calculate_seg_loss(patch_preds, mask[has_mask])
+                # patch_features is already fused across the 4 levels:
+                # (bs, patch_num, 768)
+                patch_preds = calculate_similarity_map(
+                    patch_features[has_mask], epoch_text_feature[has_mask], img_size
+                )
+                loss += calculate_seg_loss(patch_preds, mask[has_mask])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -305,7 +305,7 @@ def main():
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
-    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
+    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.7)
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()

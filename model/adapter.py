@@ -17,7 +17,7 @@ class AdaptedCLIP(nn.Module):
         enable_patch_graph: bool = True,
         patch_graph_k: int = 8,
         patch_graph_alpha: float = 0.7,
-        patch_graph_residual_weight: float = 0.2,
+        patch_graph_residual_weight: float = 0.7,
         patch_graph_use_spatial: bool = True,
         **kwargs,
     ):
@@ -45,6 +45,8 @@ class AdaptedCLIP(nn.Module):
                 alpha=patch_graph_alpha,
                 residual_weight=patch_graph_residual_weight,
                 use_spatial=patch_graph_use_spatial,
+                # 4 seg levels + 1 det group all join the same big graph
+                num_levels=len(levels) + 1,
             )
             if enable_patch_graph
             else nn.Identity()
@@ -131,12 +133,23 @@ class AdaptedCLIP(nn.Module):
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
-        seg_tokens = [self.image_adapter["patch_graph"](t) for t in seg_tokens]
-        seg_tokens = [F.normalize(t, dim=-1) for t in seg_tokens]
+        # cross-level fusion: 4 seg levels + the det group (det_proj of the last
+        # level) all enter the same big graph; after one propagation step the
+        # seg levels are averaged back into a patch map and the det group is
+        # pooled into the image-level feature.
+        det_group = self.image_adapter["det_proj"](tokens[-1])  # (B, L, 768)
+        all_tokens = torch.cat([*seg_tokens, det_group], dim=1)  # (B, 5L, 768)
+        all_tokens = self.image_adapter["patch_graph"](all_tokens)
+        num_levels = len(seg_tokens)
+        seg_size = all_tokens.shape[1] // (num_levels + 1)
+        seg_tokens = all_tokens[:, : num_levels * seg_size].view(
+            all_tokens.shape[0], num_levels, seg_size, -1
+        ).mean(dim=1)  # (B, L, 768)
+        seg_tokens = F.normalize(seg_tokens, dim=-1)
 
-        det_token = self.image_adapter["det_proj"](tokens[-1])
-        det_token = self.image_adapter["patch_graph"](det_token)
-        det_token = F.normalize(det_token, dim=-1).mean(1)
+        det_token = F.normalize(
+            all_tokens[:, num_levels * seg_size:], dim=-1
+        ).mean(1)  # (B, 768)
         return seg_tokens, det_token
 
     def encode_text(self, text, adapt_text=True):

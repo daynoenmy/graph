@@ -89,15 +89,15 @@ def get_predictions(
         pred = det_feature @ epoch_text_feature
         pred = (pred[:, 1] + 1) / 2
         preds_image.append(pred.cpu().numpy())
-        patch_preds = []
-        for f in patch_features:
-            # f: bs,patch_num,768
-            patch_pred = calculate_similarity_map(
-                f, epoch_text_feature, img_size, test=True, domain=DOMAINS[dataset]
-            )
-            patch_preds.append(patch_pred)
-        patch_preds = torch.cat(patch_preds, dim=1).sum(1).cpu().numpy()
-        preds.append(patch_preds)
+        # patch_features: (bs, patch_num, 768), already fused across the 4 levels
+        patch_pred = calculate_similarity_map(
+            patch_features,
+            epoch_text_feature,
+            img_size,
+            test=True,
+            domain=DOMAINS[dataset],
+        )
+        preds.append(patch_pred.cpu().numpy())
     masks = np.concatenate(masks, axis=0)
     labels = np.concatenate(labels, axis=0)
     preds = np.concatenate(preds, axis=0)
@@ -153,7 +153,7 @@ def main():
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
-    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.2)
+    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.7)
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
