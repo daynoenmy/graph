@@ -315,9 +315,19 @@ def main():
             pixel_validity=mask_validity,
         )
         df.loc[len(df)] = Series(class_result_dict)
-    df.loc[len(df)] = df.mean()
+    df.loc[len(df)] = df.drop(columns="class name").mean()
     df.loc[len(df) - 1, "class name"] = "Average"
-    logger.info("final results:\n%s", df.to_string(index=False, justify="center"))
+    numeric_cols = [col for col in df.columns if col != "class name"]
+    for col in numeric_cols:
+        df[col] = df[col].astype(float)
+    logger.info(
+        "final results:\n%s",
+        df.to_string(
+            index=False,
+            justify="center",
+            formatters={col: "{:.4f}".format for col in numeric_cols},
+        ),
+    )
 
 
 if __name__ == "__main__":

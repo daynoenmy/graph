@@ -37,7 +37,6 @@ class AdaptedCLIP(nn.Module):
         seg_proj = nn.ModuleList(
             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
         )
-        det_proj = SimpleProj(1024, 768, relu)
         patch_graph = (
             PatchGraphBlock(
                 dim=768,
@@ -45,8 +44,8 @@ class AdaptedCLIP(nn.Module):
                 alpha=patch_graph_alpha,
                 residual_weight=patch_graph_residual_weight,
                 use_spatial=patch_graph_use_spatial,
-                # 4 seg levels + 1 det group all join the same big graph
-                num_levels=len(levels) + 1,
+                # all seg levels join the same big graph
+                num_levels=len(levels),
             )
             if enable_patch_graph
             else nn.Identity()
@@ -55,7 +54,6 @@ class AdaptedCLIP(nn.Module):
             {
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
-                "det_proj": det_proj,
                 "patch_graph": patch_graph,
             }
         )
@@ -133,23 +131,18 @@ class AdaptedCLIP(nn.Module):
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
-        # cross-level fusion: 4 seg levels + the det group (det_proj of the last
-        # level) all enter the same big graph; after one propagation step the
-        # seg levels are averaged back into a patch map and the det group is
-        # pooled into the image-level feature.
-        det_group = self.image_adapter["det_proj"](tokens[-1])  # (B, L, 768)
-        all_tokens = torch.cat([*seg_tokens, det_group], dim=1)  # (B, 5L, 768)
-        all_tokens = self.image_adapter["patch_graph"](all_tokens)
+        # cross-level fusion: the 4 levels enter one big graph, propagate once,
+        # then are averaged back into a single fused patch feature map.
+        fused_tokens = torch.cat(seg_tokens, dim=1)  # (B, L * num_levels, 768)
+        fused_tokens = self.image_adapter["patch_graph"](fused_tokens)
         num_levels = len(seg_tokens)
-        seg_size = all_tokens.shape[1] // (num_levels + 1)
-        seg_tokens = all_tokens[:, : num_levels * seg_size].view(
-            all_tokens.shape[0], num_levels, seg_size, -1
+        seg_tokens = fused_tokens.view(
+            fused_tokens.shape[0], num_levels, fused_tokens.shape[1] // num_levels, -1
         ).mean(dim=1)  # (B, L, 768)
         seg_tokens = F.normalize(seg_tokens, dim=-1)
 
-        det_token = F.normalize(
-            all_tokens[:, num_levels * seg_size:], dim=-1
-        ).mean(1)  # (B, 768)
+        # det shares the fused cross-level patch feature, pooled over patches
+        det_token = F.normalize(seg_tokens.mean(dim=1), dim=-1)  # (B, 768)
         return seg_tokens, det_token
 
     def encode_text(self, text, adapt_text=True):
