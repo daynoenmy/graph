@@ -128,11 +128,10 @@ class BinaryDiceLoss(nn.Module):
 
 # ================================================================================================
 # The following code is used to get adapted text embeddings
-prompt = PROMPTS
-prompt_normal = prompt["prompt_normal"]
-prompt_abnormal = prompt["prompt_abnormal"]
+prompt_normal = PROMPTS["prompt_normal"]
+prompt_abnormal = PROMPTS["prompt_abnormal"]
 prompt_state = [prompt_normal, prompt_abnormal]
-prompt_templates = prompt["prompt_templates"]
+prompt_templates = PROMPTS["prompt_templates"]
 
 
 def get_adapted_single_class_text_embedding(model, dataset_name, class_name, device, adapt_text=True):
@@ -220,13 +219,15 @@ def calculate_patch_image_probability(
     patch_features: torch.Tensor,
     text_embeddings: torch.Tensor,
     temperature: float = 1.0,
+    aggregation: str = "mean",
+    topk_ratio: float = 0.01,
+    quantile: float = 0.99,
 ):
     """Aggregate patch-level anomaly probabilities into an image score.
 
-    Unlike feature averaging, this computes the normal/abnormal probability
-    of every patch first and only then averages the abnormal probabilities.
-    This keeps the image-level objective in the same prediction space as the
-    pixel-level objective and avoids normalizing a mixture of patch features.
+    ``mean`` preserves the training-time behavior. ``topk`` and ``quantile``
+    are useful at test time when a small lesion would otherwise be diluted by
+    the many normal patches in a medical image.
     """
     if temperature <= 0:
         raise ValueError("temperature must be positive")
@@ -243,8 +244,23 @@ def calculate_patch_image_probability(
         raise ValueError("text embeddings must have shape [D, 2] or [B, D, 2]")
     if logits.shape[-1] != 2:
         raise ValueError("text embeddings must contain normal and abnormal anchors")
-    patch_probabilities = torch.softmax(logits * temperature, dim=-1)
-    return patch_probabilities[..., 1].mean(dim=1)
+    patch_scores = torch.softmax(logits * temperature, dim=-1)[..., 1]
+    if aggregation == "mean":
+        return patch_scores.mean(dim=1)
+    if aggregation == "max":
+        return patch_scores.max(dim=1).values
+    if aggregation == "topk":
+        if not 0.0 < topk_ratio <= 1.0:
+            raise ValueError("topk_ratio must be in (0, 1]")
+        num_topk = max(1, int(np.ceil(patch_scores.shape[1] * topk_ratio)))
+        return patch_scores.topk(num_topk, dim=1).values.mean(dim=1)
+    if aggregation == "quantile":
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError("quantile must be in [0, 1]")
+        return torch.quantile(patch_scores.float(), quantile, dim=1)
+    raise ValueError(
+        "aggregation must be one of: mean, topk, max, quantile"
+    )
 
 
 focal_loss = FocalLoss()
