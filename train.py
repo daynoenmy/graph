@@ -17,11 +17,13 @@ from dataset import get_dataset
 from lodo_utils import (
     DEFAULT_LODO_DATASETS,
     DatasetWithName,
+    HomogeneousDatasetBatchSampler,
     configure_lodo_datasets,
 )
 from forward_utils import (
     get_adapted_text_embedding,
     get_adapted_single_class_text_embedding,
+    calculate_patch_image_probability,
     calculate_similarity_map,
     calculate_seg_loss,
 )
@@ -178,12 +180,17 @@ def train_image_adapter(
             )
 
             # forward image
-            patch_features, det_feature = model(image)
+            patch_features, _ = model(image)
             # calculate similarity and get prediction
             loss = 0.0
-            det_feature = det_feature.unsqueeze(1)
-            cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
-            loss += F.cross_entropy(cls_preds, label)
+            image_probability = calculate_patch_image_probability(
+                patch_features,
+                epoch_text_feature,
+            )
+            loss += F.binary_cross_entropy(
+                image_probability.clamp(1e-6, 1.0 - 1e-6),
+                label.float(),
+            )
             if has_mask.any():
                 # patch_features is already fused across the 4 levels:
                 # (bs, patch_num, 768)
@@ -486,13 +493,37 @@ def main():
         text_dataset = ConcatDataset(text_datasets)
         image_dataset = ConcatDataset(image_datasets)
         logger.info("leave-one-out held dataset: %s", args.leave_out)
-    text_dataloader = torch.utils.data.DataLoader(
-        text_dataset, batch_size=args.text_batch_size, shuffle=True, **kwargs
-    )
+    if args.leave_out is None:
+        text_dataloader = torch.utils.data.DataLoader(
+            text_dataset, batch_size=args.text_batch_size, shuffle=True, **kwargs
+        )
+    else:
+        text_batch_sampler = HomogeneousDatasetBatchSampler(
+            text_dataset,
+            batch_size=args.text_batch_size,
+            shuffle=True,
+        )
+        text_dataloader = torch.utils.data.DataLoader(
+            text_dataset,
+            batch_sampler=text_batch_sampler,
+            **kwargs,
+        )
     logger.info("loading image adaptation dataset ...")
-    image_dataloader = torch.utils.data.DataLoader(
-        image_dataset, batch_size=args.image_batch_size, shuffle=True, **kwargs
-    )
+    if args.leave_out is None:
+        image_dataloader = torch.utils.data.DataLoader(
+            image_dataset, batch_size=args.image_batch_size, shuffle=True, **kwargs
+        )
+    else:
+        image_batch_sampler = HomogeneousDatasetBatchSampler(
+            image_dataset,
+            batch_size=args.image_batch_size,
+            shuffle=True,
+        )
+        image_dataloader = torch.utils.data.DataLoader(
+            image_dataset,
+            batch_sampler=image_batch_sampler,
+            **kwargs,
+        )
     # ========================================================
     # training
     if adapt_text:

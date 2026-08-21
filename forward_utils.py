@@ -216,6 +216,37 @@ def calculate_similarity_map(
     return patch_preds
 
 
+def calculate_patch_image_probability(
+    patch_features: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    temperature: float = 1.0,
+):
+    """Aggregate patch-level anomaly probabilities into an image score.
+
+    Unlike feature averaging, this computes the normal/abnormal probability
+    of every patch first and only then averages the abnormal probabilities.
+    This keeps the image-level objective in the same prediction space as the
+    pixel-level objective and avoids normalizing a mixture of patch features.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    features = F.normalize(patch_features, dim=-1)
+    if text_embeddings.ndim == 2:
+        text = F.normalize(text_embeddings, dim=0)
+        logits = features @ text
+    elif text_embeddings.ndim == 3:
+        if text_embeddings.shape[0] != patch_features.shape[0]:
+            raise ValueError("batched text embeddings must match image batch size")
+        text = F.normalize(text_embeddings, dim=1)
+        logits = torch.matmul(features, text)
+    else:
+        raise ValueError("text embeddings must have shape [D, 2] or [B, D, 2]")
+    if logits.shape[-1] != 2:
+        raise ValueError("text embeddings must contain normal and abnormal anchors")
+    patch_probabilities = torch.softmax(logits * temperature, dim=-1)
+    return patch_probabilities[..., 1].mean(dim=1)
+
+
 focal_loss = FocalLoss()
 dice_loss = BinaryDiceLoss()
 
