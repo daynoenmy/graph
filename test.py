@@ -59,6 +59,10 @@ def get_predictions(
     device: str,
     img_size: int,
     dataset: str = "MVTec",
+    image_pooling: str = "topk",
+    image_topk_ratio: float = 0.01,
+    image_quantile: float = 0.99,
+    image_temperature: float = 1.0,
 ):
     masks = []
     labels = []
@@ -89,6 +93,10 @@ def get_predictions(
         pred = calculate_patch_image_probability(
             patch_features,
             epoch_text_feature,
+            temperature=image_temperature,
+            aggregation=image_pooling,
+            topk_ratio=image_topk_ratio,
+            quantile=image_quantile,
         )
         preds_image.append(pred.cpu().numpy())
         # patch_features: (bs, patch_num, 768), already fused across the 4 levels
@@ -137,6 +145,31 @@ def main():
     )
     parser.add_argument("--shot", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--image_pooling",
+        type=str,
+        default="topk",
+        choices=["mean", "topk", "max", "quantile"],
+        help="aggregate patch anomaly probabilities into an image score",
+    )
+    parser.add_argument(
+        "--image_topk_ratio",
+        type=float,
+        default=0.01,
+        help="fraction of highest-scoring patches used by topk pooling",
+    )
+    parser.add_argument(
+        "--image_quantile",
+        type=float,
+        default=0.99,
+        help="quantile used by quantile pooling",
+    )
+    parser.add_argument(
+        "--image_temperature",
+        type=float,
+        default=1.0,
+        help="positive scale applied to patch/text cosine logits",
+    )
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
@@ -296,6 +329,10 @@ def main():
                 device=device,
                 img_size=args.img_size,
                 dataset=args.dataset,
+                image_pooling=args.image_pooling,
+                image_topk_ratio=args.image_topk_ratio,
+                image_quantile=args.image_quantile,
+                image_temperature=args.image_temperature,
             )
         # ========================================================
         if args.visualize:
