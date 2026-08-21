@@ -1,13 +1,70 @@
 import json
+import math
 import os
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset, Sampler
 
 from dataset.constants import CLASS_NAMES, DATA_PATH, DOMAINS, REAL_NAMES
 
 
 DEFAULT_LODO_DATASETS = ["Chest", "Liver", "Brain", "OCT2017", "RESC", "HIS"]
+
+
+class HomogeneousDatasetBatchSampler(Sampler):
+    """Build batches without mixing component datasets of a ConcatDataset.
+
+    Every source sample is still visited once per epoch. Consequently, this
+    sampler isolates dataset-specific supervision within a batch, but it does
+    not by itself balance datasets with different numbers of samples.
+    """
+
+    def __init__(
+        self,
+        dataset: ConcatDataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        if not isinstance(dataset, ConcatDataset):
+            raise TypeError("dataset must be a torch.utils.data.ConcatDataset")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+    def __iter__(self):
+        batches = []
+        start = 0
+        for end in self.dataset.cumulative_sizes:
+            dataset_size = end - start
+            if self.shuffle:
+                local_indices = torch.randperm(dataset_size).tolist()
+            else:
+                local_indices = list(range(dataset_size))
+            source_indices = [start + index for index in local_indices]
+            for offset in range(0, dataset_size, self.batch_size):
+                batch = source_indices[offset : offset + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+            start = end
+
+        if self.shuffle and batches:
+            batch_order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in batch_order]
+        yield from batches
+
+    def __len__(self):
+        if self.drop_last:
+            return sum(
+                len(dataset) // self.batch_size for dataset in self.dataset.datasets
+            )
+        return sum(
+            math.ceil(len(dataset) / self.batch_size)
+            for dataset in self.dataset.datasets
+        )
 
 
 class DatasetWithName(Dataset):

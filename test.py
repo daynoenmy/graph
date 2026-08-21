@@ -18,6 +18,7 @@ from dataset import get_dataset, DOMAINS
 from lodo_utils import DatasetWithName, configure_lodo_datasets
 from forward_utils import (
     get_adapted_text_embedding,
+    calculate_patch_image_probability,
     calculate_similarity_map,
     metrics_eval,
     visualize,
@@ -83,11 +84,12 @@ def get_predictions(
         # get text
         epoch_text_feature = class_text_embeddings
         # forward image
-        patch_features, det_feature = model(image)
+        patch_features, _ = model(image)
         # calculate similarity and get prediction
-        # cls_preds = []
-        pred = det_feature @ epoch_text_feature
-        pred = (pred[:, 1] + 1) / 2
+        pred = calculate_patch_image_probability(
+            patch_features,
+            epoch_text_feature,
+        )
         preds_image.append(pred.cpu().numpy())
         # patch_features: (bs, patch_num, 768), already fused across the 4 levels
         patch_pred = calculate_similarity_map(
