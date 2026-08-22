@@ -37,6 +37,9 @@ class AdaptedCLIP(nn.Module):
         seg_proj = nn.ModuleList(
             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
         )
+        # The image-level branch uses the final CLS token and never consumes
+        # graph-refined localization patches.
+        det_proj = SimpleProj(1024, 768, relu=False)
         patch_graph = (
             PatchGraphBlock(
                 dim=768,
@@ -54,6 +57,7 @@ class AdaptedCLIP(nn.Module):
             {
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
+                "det_proj": det_proj,
                 "patch_graph": patch_graph,
             }
         )
@@ -70,6 +74,18 @@ class AdaptedCLIP(nn.Module):
         for p in self.text_adapter.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        # Start the independent detection projection from CLIP's pretrained
+        # visual projection instead of a random classification head.
+        visual_proj = getattr(self.image_encoder, "proj", None)
+        det_linear = self.image_adapter["det_proj"].fc
+        if visual_proj is not None and det_linear.weight.shape == visual_proj.T.shape:
+            with torch.no_grad():
+                det_linear.weight.copy_(
+                    visual_proj.T.to(
+                        device=det_linear.weight.device,
+                        dtype=det_linear.weight.dtype,
+                    )
+                )
 
     def image_trainable_parameters(self):
         yield from self.image_adapter.parameters()
@@ -126,6 +142,12 @@ class AdaptedCLIP(nn.Module):
                 tokens.append(x[1:, :, :])
 
         x = x.permute(1, 0, 2)
+        # Stop the image-level objective at its own head. Localization updates
+        # the patch adapters; classification updates only det_proj.
+        det_source = self.image_encoder.ln_post(x[:, 0, :]).detach()
+        det_token = self.image_adapter["det_proj"](det_source)
+        det_token = F.normalize(det_token, dim=-1)
+
         tokens = [t.permute(1, 0, 2) for t in tokens]
         tokens = [self.image_encoder.ln_post(t) for t in tokens]
         seg_tokens = [
@@ -141,8 +163,6 @@ class AdaptedCLIP(nn.Module):
         ).mean(dim=1)  # (B, L, 768)
         seg_tokens = F.normalize(seg_tokens, dim=-1)
 
-        # det shares the fused cross-level patch feature, pooled over patches
-        det_token = F.normalize(seg_tokens.mean(dim=1), dim=-1)  # (B, 768)
         return seg_tokens, det_token
 
     def encode_text(self, text, adapt_text=True):

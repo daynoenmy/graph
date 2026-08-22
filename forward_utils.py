@@ -215,6 +215,46 @@ def calculate_similarity_map(
     return patch_preds
 
 
+def calculate_image_logits(
+    image_features: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    temperature: float = 100.0,
+):
+    """Calculate normal/abnormal logits from an independent CLS branch."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if image_features.ndim != 2:
+        raise ValueError("image_features must have shape [B, D]")
+    features = F.normalize(image_features, dim=-1)
+    if text_embeddings.ndim == 2:
+        text = F.normalize(text_embeddings, dim=0)
+        logits = features @ text
+    elif text_embeddings.ndim == 3:
+        if text_embeddings.shape[0] != image_features.shape[0]:
+            raise ValueError("batched text embeddings must match image batch size")
+        text = F.normalize(text_embeddings, dim=1)
+        logits = torch.matmul(features.unsqueeze(1), text).squeeze(1)
+    else:
+        raise ValueError("text embeddings must have shape [D, 2] or [B, D, 2]")
+    if logits.shape[-1] != 2:
+        raise ValueError("text embeddings must contain normal and abnormal anchors")
+    return logits * temperature
+
+
+def calculate_image_probability(
+    image_features: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    temperature: float = 100.0,
+):
+    """Calculate image anomaly probability from an independent CLS branch."""
+    logits = calculate_image_logits(
+        image_features,
+        text_embeddings,
+        temperature=temperature,
+    )
+    return torch.softmax(logits, dim=-1)[:, 1]
+
+
 def calculate_patch_image_probability(
     patch_features: torch.Tensor,
     text_embeddings: torch.Tensor,

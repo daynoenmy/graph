@@ -18,6 +18,7 @@ from dataset import get_dataset, DOMAINS
 from lodo_utils import DatasetWithName, configure_lodo_datasets
 from forward_utils import (
     get_adapted_text_embedding,
+    calculate_image_probability,
     calculate_patch_image_probability,
     calculate_similarity_map,
     metrics_eval,
@@ -42,8 +43,8 @@ def get_support_features(model, support_loader, device):
     all_features = []
     for input_data in support_loader:  # bs always=1. training for an epoch first, Then use this updated model for memory bank construction.
         image = input_data[0].to(device)
-        patch_tokens = model(image)
-        patch_tokens = [t.reshape(-1, 768) for t in patch_tokens]
+        patch_tokens, _ = model(image)
+        patch_tokens = [patch_tokens.reshape(-1, 768)]
         all_features.append(patch_tokens)
     support_features = [
         torch.cat([all_features[j][i] for j in range(len(all_features))], dim=0)
@@ -59,6 +60,8 @@ def get_predictions(
     device: str,
     img_size: int,
     dataset: str = "MVTec",
+    image_score_source: str = "det",
+    det_temperature: float = 100.0,
     image_pooling: str = "topk",
     image_topk_ratio: float = 0.01,
     image_quantile: float = 0.99,
@@ -88,16 +91,23 @@ def get_predictions(
         # get text
         epoch_text_feature = class_text_embeddings
         # forward image
-        patch_features, _ = model(image)
+        patch_features, det_feature = model(image)
         # calculate similarity and get prediction
-        pred = calculate_patch_image_probability(
-            patch_features,
-            epoch_text_feature,
-            temperature=image_temperature,
-            aggregation=image_pooling,
-            topk_ratio=image_topk_ratio,
-            quantile=image_quantile,
-        )
+        if image_score_source == "det":
+            pred = calculate_image_probability(
+                det_feature,
+                epoch_text_feature,
+                temperature=det_temperature,
+            )
+        else:
+            pred = calculate_patch_image_probability(
+                patch_features,
+                epoch_text_feature,
+                temperature=image_temperature,
+                aggregation=image_pooling,
+                topk_ratio=image_topk_ratio,
+                quantile=image_quantile,
+            )
         preds_image.append(pred.cpu().numpy())
         # patch_features: (bs, patch_num, 768), already fused across the 4 levels
         patch_pred = calculate_similarity_map(
@@ -146,6 +156,19 @@ def main():
     parser.add_argument("--shot", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
+        "--image_score_source",
+        type=str,
+        default="det",
+        choices=["det", "patch"],
+        help="use the independent CLS branch or legacy patch aggregation",
+    )
+    parser.add_argument(
+        "--det_temperature",
+        type=float,
+        default=100.0,
+        help="positive scale applied to CLS/text cosine logits",
+    )
+    parser.add_argument(
         "--image_pooling",
         type=str,
         default="topk",
@@ -192,6 +215,8 @@ def main():
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
+    if args.det_temperature <= 0:
+        parser.error("--det_temperature must be positive")
     try:
         configure_lodo_datasets([args.dataset], args.data_path)
     except (FileNotFoundError, ValueError) as error:
@@ -242,6 +267,14 @@ def main():
     if not os.path.isfile(checkpoint_file):
         raise FileNotFoundError(f"image adapter checkpoint not found: {checkpoint_file}")
     checkpoint = torch.load(checkpoint_file, map_location=device)
+    has_det_branch = any(
+        key.startswith("det_proj.") for key in checkpoint["image_adapter"]
+    )
+    if args.image_score_source == "det" and not has_det_branch:
+        raise ValueError(
+            "This checkpoint has no trained independent classification branch. "
+            "Retrain with the separated model or use --image_score_source patch."
+        )
     training_setup = checkpoint.get("training_setup")
     if training_setup and training_setup.get("mode") == "leave_one_out":
         held_out_dataset = training_setup.get("held_out_dataset")
@@ -329,6 +362,8 @@ def main():
                 device=device,
                 img_size=args.img_size,
                 dataset=args.dataset,
+                image_score_source=args.image_score_source,
+                det_temperature=args.det_temperature,
                 image_pooling=args.image_pooling,
                 image_topk_ratio=args.image_topk_ratio,
                 image_quantile=args.image_quantile,
