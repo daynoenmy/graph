@@ -23,7 +23,7 @@ from lodo_utils import (
 from forward_utils import (
     get_adapted_text_embedding,
     get_adapted_single_class_text_embedding,
-    calculate_patch_image_probability,
+    calculate_image_logits,
     calculate_similarity_map,
     calculate_seg_loss,
 )
@@ -151,11 +151,16 @@ def train_image_adapter(
     img_size: int,
     logger: logging.Logger,
     default_dataset_name: str,
+    classification_loss_weight: float,
+    localization_loss_weight: float,
+    det_temperature: float,
     training_setup: dict = None,
 ):
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
+        classification_loss_list = []
+        localization_loss_list = []
         for input_data in tqdm(train_loader):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
@@ -180,36 +185,52 @@ def train_image_adapter(
             )
 
             # forward image
-            patch_features, _ = model(image)
-            # calculate similarity and get prediction
-            loss = 0.0
-            image_probability = calculate_patch_image_probability(
-                patch_features,
+            patch_features, det_feature = model(image)
+            # The classification branch consumes only the independent CLS
+            # feature; the localization branch consumes only patch features.
+            image_logits = calculate_image_logits(
+                det_feature,
                 epoch_text_feature,
+                temperature=det_temperature,
             )
-            loss += F.binary_cross_entropy(
-                image_probability.clamp(1e-6, 1.0 - 1e-6),
-                label.float(),
-            )
+            classification_loss = F.cross_entropy(image_logits, label.long())
+            loss = classification_loss_weight * classification_loss
+            localization_loss = None
             if has_mask.any():
                 # patch_features is already fused across the 4 levels:
                 # (bs, patch_num, 768)
                 patch_preds = calculate_similarity_map(
                     patch_features[has_mask], epoch_text_feature[has_mask], img_size
                 )
-                loss += calculate_seg_loss(patch_preds, mask[has_mask])
+                localization_loss = calculate_seg_loss(
+                    patch_preds, mask[has_mask]
+                )
+                loss += localization_loss_weight * localization_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             loss_list.append(loss.item())
+            classification_loss_list.append(classification_loss.item())
+            if localization_loss is not None:
+                localization_loss_list.append(localization_loss.item())
             scheduler.step()
-        logger.info(f"loss: {np.mean(loss_list)}")
+        logger.info(
+            "loss: %.6f, classification_loss: %.6f, localization_loss: %s",
+            np.mean(loss_list),
+            np.mean(classification_loss_list),
+            (
+                f"{np.mean(localization_loss_list):.6f}"
+                if localization_loss_list
+                else "N/A"
+            ),
+        )
         # save checkpoint
         model_dict = {
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
             "training_setup": training_setup,
+            "classification_branch": "independent_cls_v1",
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -309,6 +330,9 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    parser.add_argument("--classification_loss_weight", type=float, default=1.0)
+    parser.add_argument("--localization_loss_weight", type=float, default=1.0)
+    parser.add_argument("--det_temperature", type=float, default=100.0)
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
@@ -316,6 +340,12 @@ def main():
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
+    if args.classification_loss_weight < 0:
+        parser.error("--classification_loss_weight must be non-negative")
+    if args.localization_loss_weight < 0:
+        parser.error("--localization_loss_weight must be non-negative")
+    if args.det_temperature <= 0:
+        parser.error("--det_temperature must be positive")
     if args.leave_out is not None:
         if len(args.datasets) != len(set(args.datasets)):
             parser.error("--datasets must not contain duplicates")
@@ -428,6 +458,14 @@ def main():
     if len(file) > 0:
         checkpoint = torch.load(file[0])
         validate_checkpoint_setup(checkpoint, training_setup)
+        if not any(
+            key.startswith("det_proj.")
+            for key in checkpoint["image_adapter"]
+        ):
+            raise ValueError(
+                "The existing image checkpoint has no trained independent "
+                "classification branch. Use a new --save_path for this model."
+            )
         image_start_epoch = checkpoint["epoch"]
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         try:
@@ -565,6 +603,9 @@ def main():
         img_size=args.img_size,
         logger=logger,
         default_dataset_name=args.dataset,
+        classification_loss_weight=args.classification_loss_weight,
+        localization_loss_weight=args.localization_loss_weight,
+        det_temperature=args.det_temperature,
         training_setup=training_setup,
     )
 
