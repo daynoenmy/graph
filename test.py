@@ -18,6 +18,7 @@ from dataset import get_dataset, DOMAINS
 from lodo_utils import DatasetWithName, configure_lodo_datasets
 from forward_utils import (
     get_adapted_text_embedding,
+    get_classification_text_embedding,
     calculate_image_probability,
     calculate_patch_image_probability,
     calculate_similarity_map,
@@ -55,7 +56,8 @@ def get_support_features(model, support_loader, device):
 
 def get_predictions(
     model: nn.Module,
-    class_text_embeddings: torch.Tensor,
+    localization_text_embeddings: torch.Tensor,
+    classification_text_embeddings: torch.Tensor,
     test_loader: DataLoader,
     device: str,
     img_size: int,
@@ -89,20 +91,19 @@ def get_predictions(
         labels.append(label)
         file_names.extend(file_name)
         # get text
-        epoch_text_feature = class_text_embeddings
         # forward image
         patch_features, det_feature = model(image)
         # calculate similarity and get prediction
         if image_score_source == "det":
             pred = calculate_image_probability(
                 det_feature,
-                epoch_text_feature,
+                classification_text_embeddings,
                 temperature=det_temperature,
             )
         else:
             pred = calculate_patch_image_probability(
                 patch_features,
-                epoch_text_feature,
+                localization_text_embeddings,
                 temperature=image_temperature,
                 aggregation=image_pooling,
                 topk_ratio=image_topk_ratio,
@@ -112,7 +113,7 @@ def get_predictions(
         # patch_features: (bs, patch_num, 768), already fused across the 4 levels
         patch_pred = calculate_similarity_map(
             patch_features,
-            epoch_text_feature,
+            localization_text_embeddings,
             img_size,
             test=True,
             domain=DOMAINS[dataset],
@@ -275,6 +276,16 @@ def main():
             "This checkpoint has no trained independent classification branch. "
             "Retrain with the separated model or use --image_score_source patch."
         )
+    if (
+        args.image_score_source == "det"
+        and checkpoint.get("classification_text_branch")
+        != "frozen_clip_medical_v1"
+    ):
+        raise ValueError(
+            "This checkpoint was trained with a different classification text "
+            "branch. Retrain with a new --save_path or use "
+            "--image_score_source patch."
+        )
     training_setup = checkpoint.get("training_setup")
     if training_setup and training_setup.get("mode") == "leave_one_out":
         held_out_dataset = training_setup.get("held_out_dataset")
@@ -329,13 +340,18 @@ def main():
         }
     with torch.no_grad():
         if adapt_text:
-            text_embeddings = get_adapted_text_embedding(
+            localization_text_embeddings = get_adapted_text_embedding(
                 model, args.dataset, device
             )
         else:
-            text_embeddings = get_adapted_text_embedding(
+            localization_text_embeddings = get_adapted_text_embedding(
                 model, args.dataset, device, adapt_text=False
             )
+        classification_text_embeddings = get_classification_text_embedding(
+            model,
+            args.dataset,
+            device,
+        )
     # ========================================================
     df = DataFrame(
         columns=[
@@ -354,10 +370,16 @@ def main():
         # ========================================================
         # testing
         with torch.no_grad():
-            class_text_embeddings = text_embeddings[class_name]
+            class_localization_text_embeddings = localization_text_embeddings[
+                class_name
+            ]
+            class_classification_text_embeddings = classification_text_embeddings[
+                class_name
+            ]
             masks, labels, preds, preds_image, mask_validity, file_names = get_predictions(
                 model=model,
-                class_text_embeddings=class_text_embeddings,
+                localization_text_embeddings=class_localization_text_embeddings,
+                classification_text_embeddings=class_classification_text_embeddings,
                 test_loader=image_dataloader,
                 device=device,
                 img_size=args.img_size,

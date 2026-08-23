@@ -166,3 +166,39 @@ PROMPTS = {
         "a medical image of {}.",
     ],
 }
+
+# Classification uses modality-specific global descriptions. These prompts
+# are encoded by the frozen CLIP text encoder and are intentionally separate
+# from PROMPTS, which remain adapted for patch localization.
+CLASSIFICATION_REAL_NAMES = {
+    "Chest": {"Chest": "chest X-ray"},
+    "Brain": {"Brain": "brain MRI scan"},
+    "Liver": {"Liver": "liver CT scan"},
+    "OCT2017": {"OCT2017": "retinal OCT image"},
+    "RESC": {"RESC": "retinal OCT image"},
+    "HIS": {"HIS": "histopathology image"},
+    "Retina": {"Retina": "retinal image"},
+    "Colon_clinicDB": {"Colon_clinicDB": "colon endoscopy image"},
+    "Colon_colonDB": {"Colon_colonDB": "colon endoscopy image"},
+    "Colon_cvc300": {"CVC-300": "colon endoscopy image"},
+    "Colon_Kvasir": {"Kvasir": "colon endoscopy image"},
+}
+
+CLASSIFICATION_PROMPTS = {
+    "prompt_normal": [
+        "a normal {}",
+        "a healthy {}",
+        "a {} without abnormalities",
+    ],
+    "prompt_abnormal": [
+        "an abnormal {}",
+        "a pathological {}",
+        "a {} with an abnormality",
+        "a {} with a lesion",
+        "a {} showing signs of disease",
+    ],
+    "prompt_templates": [
+        "{}.",
+        "a medical image of {}.",
+    ],
+}

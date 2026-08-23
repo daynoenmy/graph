@@ -23,6 +23,7 @@ from lodo_utils import (
 from forward_utils import (
     get_adapted_text_embedding,
     get_adapted_single_class_text_embedding,
+    get_classification_text_embedding,
     calculate_image_logits,
     calculate_similarity_map,
     calculate_seg_loss,
@@ -140,7 +141,8 @@ def train_text_adapter(
 
 def train_image_adapter(
     model: nn.Module,
-    text_embeddings: torch.Tensor,
+    localization_text_embeddings: dict,
+    classification_text_embeddings: dict,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler,
@@ -176,9 +178,16 @@ def train_image_adapter(
                 has_mask = torch.ones(len(class_names), dtype=torch.bool, device=device)
             else:
                 has_mask = has_mask.to(device=device, dtype=torch.bool)
-            epoch_text_feature = torch.stack(
+            localization_text_feature = torch.stack(
                 [
-                    text_embeddings[(sample_dataset, class_name)]
+                    localization_text_embeddings[(sample_dataset, class_name)]
+                    for sample_dataset, class_name in zip(dataset_names, class_names)
+                ],
+                dim=0,
+            )
+            classification_text_feature = torch.stack(
+                [
+                    classification_text_embeddings[(sample_dataset, class_name)]
                     for sample_dataset, class_name in zip(dataset_names, class_names)
                 ],
                 dim=0,
@@ -190,7 +199,7 @@ def train_image_adapter(
             # feature; the localization branch consumes only patch features.
             image_logits = calculate_image_logits(
                 det_feature,
-                epoch_text_feature,
+                classification_text_feature,
                 temperature=det_temperature,
             )
             classification_loss = F.cross_entropy(image_logits, label.long())
@@ -200,7 +209,9 @@ def train_image_adapter(
                 # patch_features is already fused across the 4 levels:
                 # (bs, patch_num, 768)
                 patch_preds = calculate_similarity_map(
-                    patch_features[has_mask], epoch_text_feature[has_mask], img_size
+                    patch_features[has_mask],
+                    localization_text_feature[has_mask],
+                    img_size,
                 )
                 localization_loss = calculate_seg_loss(
                     patch_preds, mask[has_mask]
@@ -231,6 +242,7 @@ def train_image_adapter(
             "image_optimizer": optimizer.state_dict(),
             "training_setup": training_setup,
             "classification_branch": "independent_cls_v1",
+            "classification_text_branch": "frozen_clip_medical_v1",
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -247,6 +259,19 @@ def get_training_text_embeddings(model, dataset_names, device, adapt_text=True):
     for dataset_name in dataset_names:
         dataset_embeddings = get_adapted_text_embedding(
             model, dataset_name, device, adapt_text=adapt_text
+        )
+        for class_name, embedding in dataset_embeddings.items():
+            text_embeddings[(dataset_name, class_name)] = embedding
+    return text_embeddings
+
+
+def get_training_classification_text_embeddings(model, dataset_names, device):
+    text_embeddings = {}
+    for dataset_name in dataset_names:
+        dataset_embeddings = get_classification_text_embedding(
+            model,
+            dataset_name,
+            device,
         )
         for class_name, embedding in dataset_embeddings.items():
             text_embeddings[(dataset_name, class_name)] = embedding
@@ -466,6 +491,11 @@ def main():
                 "The existing image checkpoint has no trained independent "
                 "classification branch. Use a new --save_path for this model."
             )
+        if checkpoint.get("classification_text_branch") != "frozen_clip_medical_v1":
+            raise ValueError(
+                "The existing image checkpoint was trained with a different "
+                "classification text branch. Use a new --save_path."
+            )
         image_start_epoch = checkpoint["epoch"]
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         try:
@@ -584,15 +614,23 @@ def main():
     del text_dataloader, text_dataset, clip_surgery, text_optimizer
     torch.cuda.empty_cache()
     with torch.no_grad():
-        text_embeddings = get_training_text_embeddings(
+        localization_text_embeddings = get_training_text_embeddings(
             model,
             training_dataset_names,
             device,
             adapt_text=args.text_epoch != 0,
         )
+        classification_text_embeddings = (
+            get_training_classification_text_embeddings(
+                model,
+                training_dataset_names,
+                device,
+            )
+        )
     model = train_image_adapter(
         model=model,
-        text_embeddings=text_embeddings,
+        localization_text_embeddings=localization_text_embeddings,
+        classification_text_embeddings=classification_text_embeddings,
         image_epoch=args.image_epoch,
         train_loader=image_dataloader,
         optimizer=image_optimizer,
