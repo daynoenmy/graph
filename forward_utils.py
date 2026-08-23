@@ -7,7 +7,13 @@ from torch.nn import functional as F
 from tqdm import tqdm
 from kornia.filters import gaussian_blur2d
 import ipdb
-from dataset.constants import CLASS_NAMES, REAL_NAMES, PROMPTS
+from dataset.constants import (
+    CLASSIFICATION_PROMPTS,
+    CLASSIFICATION_REAL_NAMES,
+    CLASS_NAMES,
+    PROMPTS,
+    REAL_NAMES,
+)
 from model.tokenizer import tokenize
 from sklearn.metrics import roc_auc_score, average_precision_score
 import pandas as pd
@@ -189,6 +195,61 @@ def get_adapted_text_embedding(model, dataset_name, device, adapt_text=True):
         )
         ret_dict[class_name] = text_features
     return ret_dict
+
+
+def get_classification_single_class_text_embedding(
+    model,
+    dataset_name,
+    class_name,
+    device,
+):
+    """Build global classification anchors with the frozen CLIP text encoder."""
+    if class_name == "object":
+        real_name = class_name
+    else:
+        assert class_name in CLASS_NAMES[dataset_name], (
+            f"class_name {class_name} not found; available class_names: "
+            f"{CLASS_NAMES[dataset_name]}"
+        )
+        real_name = CLASSIFICATION_REAL_NAMES.get(dataset_name, {}).get(
+            class_name,
+            REAL_NAMES[dataset_name][class_name],
+        )
+
+    prompt_state = [
+        CLASSIFICATION_PROMPTS["prompt_normal"],
+        CLASSIFICATION_PROMPTS["prompt_abnormal"],
+    ]
+    prompt_templates = CLASSIFICATION_PROMPTS["prompt_templates"]
+    text_features = []
+    for states in prompt_state:
+        prompted_states = [state.format(real_name) for state in states]
+        prompted_sentences = [
+            template.format(state)
+            for state in prompted_states
+            for template in prompt_templates
+        ]
+        tokenized_sentences = tokenize(prompted_sentences).to(device)
+        class_embeddings = model.encode_text(
+            tokenized_sentences,
+            adapt_text=False,
+        )
+        class_embeddings = F.normalize(class_embeddings, dim=-1)
+        class_embedding = F.normalize(class_embeddings.mean(dim=0), dim=0)
+        text_features.append(class_embedding)
+    return torch.stack(text_features, dim=1).to(device)
+
+
+def get_classification_text_embedding(model, dataset_name, device):
+    return {
+        class_name: get_classification_single_class_text_embedding(
+            model,
+            dataset_name,
+            class_name,
+            device,
+        )
+        for class_name in CLASS_NAMES[dataset_name]
+    }
 
 
 # ================================================================================================
