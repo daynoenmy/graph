@@ -144,8 +144,9 @@ def train_image_adapter(
     localization_text_embeddings: dict,
     classification_text_embeddings: dict,
     train_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler,
+    localization_optimizer: torch.optim.Optimizer,
+    det_optimizer: torch.optim.Optimizer,
+    localization_scheduler: torch.optim.lr_scheduler,
     device: str,
     start_epoch: int,
     save_path: str,
@@ -158,6 +159,8 @@ def train_image_adapter(
     det_temperature: float,
     training_setup: dict = None,
 ):
+    # Keep the frozen CLIP backbone in eval mode while enabling det-head dropout.
+    model.image_adapter["det_head"].train()
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
@@ -217,16 +220,19 @@ def train_image_adapter(
                     patch_preds, mask[has_mask]
                 )
                 loss += localization_loss_weight * localization_loss
-            optimizer.zero_grad()
+            localization_optimizer.zero_grad()
+            det_optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            localization_optimizer.step()
+            det_optimizer.step()
             loss_list.append(loss.item())
             classification_loss_list.append(classification_loss.item())
             if localization_loss is not None:
                 localization_loss_list.append(localization_loss.item())
-            scheduler.step()
+            localization_scheduler.step()
         logger.info(
-            "loss: %.6f, classification_loss: %.6f, localization_loss: %s",
+            "loss: %.6f, classification_loss: %.6f, localization_loss: %s, "
+            "localization_lr: %.3e, det_lr: %.3e",
             np.mean(loss_list),
             np.mean(classification_loss_list),
             (
@@ -234,15 +240,25 @@ def train_image_adapter(
                 if localization_loss_list
                 else "N/A"
             ),
+            localization_optimizer.param_groups[0]["lr"],
+            det_optimizer.param_groups[0]["lr"],
         )
         # save checkpoint
+        det_head = model.image_adapter["det_head"]
         model_dict = {
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
-            "image_optimizer": optimizer.state_dict(),
+            "localization_optimizer": localization_optimizer.state_dict(),
+            "det_optimizer": det_optimizer.state_dict(),
+            "localization_scheduler": localization_scheduler.state_dict(),
             "training_setup": training_setup,
-            "classification_branch": "independent_cls_v1",
+            "classification_branch": "residual_bottleneck_cls_v2",
             "classification_text_branch": "frozen_clip_medical_v1",
+            "det_head_config": {
+                "hidden_dim": det_head.down.out_features,
+                "dropout": det_head.dropout.p,
+                "residual_scale": det_head.residual_scale,
+            },
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -342,7 +358,24 @@ def main():
     parser.add_argument("--text_epoch", type=int, default=5, help="epochs for stage1")
     parser.add_argument("--image_epoch", type=int, default=20, help="epochs for stage2")
     parser.add_argument("--text_lr", type=float, default=0.00001, help="learning rate for stage1")
-    parser.add_argument("--image_lr", type=float, default=0.0005, help="learning rate for stage2")
+    parser.add_argument(
+        "--image_lr",
+        type=float,
+        default=0.0005,
+        help="learning rate for the stage2 localization branch",
+    )
+    parser.add_argument(
+        "--det_lr",
+        type=float,
+        default=0.0001,
+        help="learning rate for the residual image-classification head",
+    )
+    parser.add_argument(
+        "--det_weight_decay",
+        type=float,
+        default=0.0001,
+        help="AdamW weight decay for the residual image-classification head",
+    )
     parser.add_argument(
         "--criterion", type=str, default=["dice_loss", "focal_loss"], nargs="+"
     )
@@ -358,6 +391,9 @@ def main():
     parser.add_argument("--classification_loss_weight", type=float, default=1.0)
     parser.add_argument("--localization_loss_weight", type=float, default=1.0)
     parser.add_argument("--det_temperature", type=float, default=100.0)
+    parser.add_argument("--det_hidden_dim", type=int, default=128)
+    parser.add_argument("--det_dropout", type=float, default=0.1)
+    parser.add_argument("--det_residual_scale", type=float, default=1.0)
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
     parser.add_argument("--patch_graph_k", type=int, default=8)
     parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
@@ -371,6 +407,18 @@ def main():
         parser.error("--localization_loss_weight must be non-negative")
     if args.det_temperature <= 0:
         parser.error("--det_temperature must be positive")
+    if args.image_lr <= 0:
+        parser.error("--image_lr must be positive")
+    if args.det_lr <= 0:
+        parser.error("--det_lr must be positive")
+    if args.det_weight_decay < 0:
+        parser.error("--det_weight_decay must be non-negative")
+    if args.det_hidden_dim <= 0:
+        parser.error("--det_hidden_dim must be positive")
+    if not 0.0 <= args.det_dropout < 1.0:
+        parser.error("--det_dropout must be in [0, 1)")
+    if args.det_residual_scale < 0:
+        parser.error("--det_residual_scale must be non-negative")
     if args.leave_out is not None:
         if len(args.datasets) != len(set(args.datasets)):
             parser.error("--datasets must not contain duplicates")
@@ -446,6 +494,9 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
+        det_hidden_dim=args.det_hidden_dim,
+        det_dropout=args.det_dropout,
+        det_residual_scale=args.det_residual_scale,
     ).to(device)
     model.eval()
     # set optimizer
@@ -454,13 +505,21 @@ def main():
         lr=args.text_lr,
         betas=(0.5, 0.999),
     )
-    image_optimizer = torch.optim.Adam(
-        model.image_trainable_parameters(),
+    localization_optimizer = torch.optim.Adam(
+        model.localization_trainable_parameters(),
         lr=args.image_lr,
         betas=(0.5, 0.999),
     )
+    det_optimizer = torch.optim.AdamW(
+        model.classification_trainable_parameters(),
+        lr=args.det_lr,
+        betas=(0.9, 0.999),
+        weight_decay=args.det_weight_decay,
+    )
     # text_scheduler = MultiStepLR(text_optimizer, milestones=[400], gamma=0.1)
-    image_scheduler = MultiStepLR(image_optimizer, milestones=[16000, 32000], gamma=0.5)
+    localization_scheduler = MultiStepLR(
+        localization_optimizer, milestones=[16000, 32000], gamma=0.5
+    )
     # ========================================================
     # load checkpoints if exists
     text_file = glob(args.save_path + "/text_adapter.pth")
@@ -483,25 +542,42 @@ def main():
     if len(file) > 0:
         checkpoint = torch.load(file[0])
         validate_checkpoint_setup(checkpoint, training_setup)
-        if not any(
-            key.startswith("det_proj.")
-            for key in checkpoint["image_adapter"]
-        ):
+        if checkpoint.get("classification_branch") != "residual_bottleneck_cls_v2":
             raise ValueError(
-                "The existing image checkpoint has no trained independent "
-                "classification branch. Use a new --save_path for this model."
+                "The existing image checkpoint uses a different classification "
+                "head. Use a new --save_path for the residual det-head experiment."
             )
         if checkpoint.get("classification_text_branch") != "frozen_clip_medical_v1":
             raise ValueError(
                 "The existing image checkpoint was trained with a different "
                 "classification text branch. Use a new --save_path."
             )
+        requested_det_head_config = {
+            "hidden_dim": args.det_hidden_dim,
+            "dropout": args.det_dropout,
+            "residual_scale": args.det_residual_scale,
+        }
+        if checkpoint.get("det_head_config") != requested_det_head_config:
+            raise ValueError(
+                "The existing image checkpoint det-head configuration "
+                f"{checkpoint.get('det_head_config')} does not match "
+                f"{requested_det_head_config}. Use matching arguments or a new "
+                "--save_path."
+            )
         image_start_epoch = checkpoint["epoch"]
         model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
         try:
-            image_optimizer.load_state_dict(checkpoint["image_optimizer"])
-        except ValueError:
-            logger.info("skip image optimizer state because trainable parameters changed")
+            localization_optimizer.load_state_dict(
+                checkpoint["localization_optimizer"]
+            )
+            det_optimizer.load_state_dict(checkpoint["det_optimizer"])
+            localization_scheduler.load_state_dict(
+                checkpoint["localization_scheduler"]
+            )
+        except (KeyError, ValueError):
+            logger.info(
+                "skip image optimizer state because trainable parameters changed"
+            )
     else:
         image_start_epoch = 0
     # ========================================================
@@ -633,8 +709,9 @@ def main():
         classification_text_embeddings=classification_text_embeddings,
         image_epoch=args.image_epoch,
         train_loader=image_dataloader,
-        optimizer=image_optimizer,
-        scheduler=image_scheduler,
+        localization_optimizer=localization_optimizer,
+        det_optimizer=det_optimizer,
+        localization_scheduler=localization_scheduler,
         device=device,
         start_epoch=image_start_epoch,
         save_path=args.save_path,
