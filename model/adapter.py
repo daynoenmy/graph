@@ -1,7 +1,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .adapter_modules import PatchGraphBlock, SimpleAdapter, SimpleProj
+from .adapter_modules import (
+    PatchGraphBlock,
+    ResidualBottleneckHead,
+    SimpleAdapter,
+    SimpleProj,
+)
 
 
 class AdaptedCLIP(nn.Module):
@@ -19,6 +24,9 @@ class AdaptedCLIP(nn.Module):
         patch_graph_alpha: float = 0.7,
         patch_graph_residual_weight: float = 0.7,
         patch_graph_use_spatial: bool = True,
+        det_hidden_dim: int = 128,
+        det_dropout: float = 0.1,
+        det_residual_scale: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -37,9 +45,14 @@ class AdaptedCLIP(nn.Module):
         seg_proj = nn.ModuleList(
             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
         )
-        # The image-level branch uses the final CLS token and never consumes
-        # graph-refined localization patches.
-        det_proj = SimpleProj(1024, 768, relu=False)
+        # Keep CLIP's frozen visual projection as the image-level baseline and
+        # learn only a compact residual in its 768-D joint embedding space.
+        det_head = ResidualBottleneckHead(
+            dim=768,
+            hidden_dim=det_hidden_dim,
+            dropout=det_dropout,
+            residual_scale=det_residual_scale,
+        )
         patch_graph = (
             PatchGraphBlock(
                 dim=768,
@@ -57,7 +70,7 @@ class AdaptedCLIP(nn.Module):
             {
                 "layer_adapters": layer_adapters,
                 "seg_proj": seg_proj,
-                "det_proj": det_proj,
+                "det_head": det_head,
                 "patch_graph": patch_graph,
             }
         )
@@ -74,21 +87,20 @@ class AdaptedCLIP(nn.Module):
         for p in self.text_adapter.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        # Start the independent detection projection from CLIP's pretrained
-        # visual projection instead of a random classification head.
-        visual_proj = getattr(self.image_encoder, "proj", None)
-        det_linear = self.image_adapter["det_proj"].fc
-        if visual_proj is not None and det_linear.weight.shape == visual_proj.T.shape:
-            with torch.no_grad():
-                det_linear.weight.copy_(
-                    visual_proj.T.to(
-                        device=det_linear.weight.device,
-                        dtype=det_linear.weight.dtype,
-                    )
-                )
+        # The generic Xavier pass above would overwrite the zero-initialized
+        # residual output projection, so restore the identity initialization.
+        self.image_adapter["det_head"].reset_parameters()
 
     def image_trainable_parameters(self):
         yield from self.image_adapter.parameters()
+
+    def localization_trainable_parameters(self):
+        yield from self.image_adapter["layer_adapters"].parameters()
+        yield from self.image_adapter["seg_proj"].parameters()
+        yield from self.image_adapter["patch_graph"].parameters()
+
+    def classification_trainable_parameters(self):
+        yield from self.image_adapter["det_head"].parameters()
 
     def text_trainable_parameters(self):
         yield from self.text_adapter.parameters()
@@ -142,10 +154,15 @@ class AdaptedCLIP(nn.Module):
                 tokens.append(x[1:, :, :])
 
         x = x.permute(1, 0, 2)
-        # Stop the image-level objective at its own head. Localization updates
-        # the patch adapters; classification updates only det_proj.
+        # Stop the image-level objective before the shared visual backbone.
+        # Classification starts from CLIP's frozen visual projection and
+        # updates only the compact residual head.
         det_source = self.image_encoder.ln_post(x[:, 0, :]).detach()
-        det_token = self.image_adapter["det_proj"](det_source)
+        visual_proj = getattr(self.image_encoder, "proj", None)
+        if visual_proj is None:
+            raise RuntimeError("the CLIP visual encoder has no projection matrix")
+        det_base = det_source @ visual_proj.detach()
+        det_token = self.image_adapter["det_head"](det_base)
         det_token = F.normalize(det_token, dim=-1)
 
         tokens = [t.permute(1, 0, 2) for t in tokens]
