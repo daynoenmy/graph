@@ -169,6 +169,9 @@ def main():
         default=100.0,
         help="positive scale applied to CLS/text cosine logits",
     )
+    parser.add_argument("--det_hidden_dim", type=int, default=128)
+    parser.add_argument("--det_dropout", type=float, default=0.1)
+    parser.add_argument("--det_residual_scale", type=float, default=1.0)
     parser.add_argument(
         "--image_pooling",
         type=str,
@@ -218,6 +221,12 @@ def main():
     args = parser.parse_args()
     if args.det_temperature <= 0:
         parser.error("--det_temperature must be positive")
+    if args.det_hidden_dim <= 0:
+        parser.error("--det_hidden_dim must be positive")
+    if not 0.0 <= args.det_dropout < 1.0:
+        parser.error("--det_dropout must be in [0, 1)")
+    if args.det_residual_scale < 0:
+        parser.error("--det_residual_scale must be non-negative")
     try:
         configure_lodo_datasets([args.dataset], args.data_path)
     except (FileNotFoundError, ValueError) as error:
@@ -259,6 +268,9 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
+        det_hidden_dim=args.det_hidden_dim,
+        det_dropout=args.det_dropout,
+        det_residual_scale=args.det_residual_scale,
     ).to(device)
     model.eval()
     # load checkpoints if exists
@@ -269,12 +281,21 @@ def main():
         raise FileNotFoundError(f"image adapter checkpoint not found: {checkpoint_file}")
     checkpoint = torch.load(checkpoint_file, map_location=device)
     has_det_branch = any(
-        key.startswith("det_proj.") for key in checkpoint["image_adapter"]
+        key.startswith("det_head.") for key in checkpoint["image_adapter"]
     )
     if args.image_score_source == "det" and not has_det_branch:
         raise ValueError(
-            "This checkpoint has no trained independent classification branch. "
-            "Retrain with the separated model or use --image_score_source patch."
+            "This checkpoint has no trained residual classification head. "
+            "Retrain with a new --save_path or use --image_score_source patch."
+        )
+    if (
+        args.image_score_source == "det"
+        and checkpoint.get("classification_branch")
+        != "residual_bottleneck_cls_v2"
+    ):
+        raise ValueError(
+            "This checkpoint uses a different classification head. Retrain "
+            "with the residual det head or use --image_score_source patch."
         )
     if (
         args.image_score_source == "det"
@@ -285,6 +306,20 @@ def main():
             "This checkpoint was trained with a different classification text "
             "branch. Retrain with a new --save_path or use "
             "--image_score_source patch."
+        )
+    requested_det_head_config = {
+        "hidden_dim": args.det_hidden_dim,
+        "dropout": args.det_dropout,
+        "residual_scale": args.det_residual_scale,
+    }
+    if (
+        args.image_score_source == "det"
+        and checkpoint.get("det_head_config") != requested_det_head_config
+    ):
+        raise ValueError(
+            "Checkpoint det-head configuration "
+            f"{checkpoint.get('det_head_config')} does not match "
+            f"{requested_det_head_config}. Use the training-time det arguments."
         )
     training_setup = checkpoint.get("training_setup")
     if training_setup and training_setup.get("mode") == "leave_one_out":
