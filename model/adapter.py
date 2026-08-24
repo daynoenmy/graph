@@ -102,6 +102,24 @@ class AdaptedCLIP(nn.Module):
     def classification_trainable_parameters(self):
         yield from self.image_adapter["det_head"].parameters()
 
+    def patch_graph_config(self):
+        config = {
+            "enabled": self.enable_patch_graph,
+            "num_levels": len(self.levels),
+        }
+        if not self.enable_patch_graph:
+            return config
+        patch_graph = self.image_adapter["patch_graph"]
+        config.update(
+            {
+                "k": patch_graph.k,
+                "alpha": patch_graph.alpha,
+                "residual_weight": patch_graph.residual_weight,
+                "use_spatial": patch_graph.use_spatial,
+            }
+        )
+        return config
+
     def text_trainable_parameters(self):
         yield from self.text_adapter.parameters()
 
@@ -170,14 +188,15 @@ class AdaptedCLIP(nn.Module):
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
-        # cross-level fusion: the 4 levels enter one big graph, propagate once,
-        # then are averaged back into a single fused patch feature map.
+        # The four levels enter one graph and propagate jointly. Keep the level
+        # axis afterwards so localization maps can be fused after text
+        # similarity instead of averaging features before similarity.
         fused_tokens = torch.cat(seg_tokens, dim=1)  # (B, L * num_levels, 768)
         fused_tokens = self.image_adapter["patch_graph"](fused_tokens)
         num_levels = len(seg_tokens)
-        seg_tokens = fused_tokens.view(
+        seg_tokens = fused_tokens.reshape(
             fused_tokens.shape[0], num_levels, fused_tokens.shape[1] // num_levels, -1
-        ).mean(dim=1)  # (B, L, 768)
+        )  # (B, num_levels, L, 768)
         seg_tokens = F.normalize(seg_tokens, dim=-1)
 
         return seg_tokens, det_token
