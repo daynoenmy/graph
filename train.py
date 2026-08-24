@@ -209,8 +209,9 @@ def train_image_adapter(
             loss = classification_loss_weight * classification_loss
             localization_loss = None
             if has_mask.any():
-                # patch_features is already fused across the 4 levels:
-                # (bs, patch_num, 768)
+                # Graph-refined features keep their level axis:
+                # (bs, num_levels, patch_num, 768). Similarity maps are
+                # calculated independently and averaged by the utility.
                 patch_preds = calculate_similarity_map(
                     patch_features[has_mask],
                     localization_text_feature[has_mask],
@@ -254,6 +255,8 @@ def train_image_adapter(
             "training_setup": training_setup,
             "classification_branch": "residual_bottleneck_cls_v2",
             "classification_text_branch": "frozen_clip_medical_v1",
+            "localization_fusion": "multilevel_score_mean_v2",
+            "patch_graph_config": model.patch_graph_config(),
             "det_head_config": {
                 "hidden_dim": det_head.down.out_features,
                 "dropout": det_head.dropout.p,
@@ -551,6 +554,20 @@ def main():
             raise ValueError(
                 "The existing image checkpoint was trained with a different "
                 "classification text branch. Use a new --save_path."
+            )
+        if checkpoint.get("localization_fusion") != "multilevel_score_mean_v2":
+            raise ValueError(
+                "The existing image checkpoint was trained with feature-level "
+                "localization fusion. Use a new --save_path for the multilevel "
+                "score-fusion experiment."
+            )
+        requested_patch_graph_config = model.patch_graph_config()
+        if checkpoint.get("patch_graph_config") != requested_patch_graph_config:
+            raise ValueError(
+                "The existing image checkpoint Patch Graph configuration "
+                f"{checkpoint.get('patch_graph_config')} does not match "
+                f"{requested_patch_graph_config}. Use the training-time Graph "
+                "arguments."
             )
         requested_det_head_config = {
             "hidden_dim": args.det_hidden_dim,
