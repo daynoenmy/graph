@@ -256,6 +256,31 @@ def get_classification_text_embedding(model, dataset_name, device):
 def calculate_similarity_map(
     patch_features, epoch_text_feature, img_size, test=False, domain="Medical"
 ):
+    """Create a localization map, averaging maps rather than level features.
+
+    A 4-D input has shape [B, num_levels, num_patches, embedding_dim]. Each
+    level is independently compared with the text anchors and converted into
+    the same training probability map or test anomaly map. Equal-weight score
+    fusion avoids cancelling small lesions in the embedding space.
+    """
+    if patch_features.ndim == 4:
+        if patch_features.shape[1] == 0:
+            raise ValueError("patch_features must contain at least one level")
+        level_predictions = [
+            calculate_similarity_map(
+                patch_features[:, level],
+                epoch_text_feature,
+                img_size,
+                test=test,
+                domain=domain,
+            )
+            for level in range(patch_features.shape[1])
+        ]
+        return torch.stack(level_predictions, dim=0).mean(dim=0)
+    if patch_features.ndim != 3:
+        raise ValueError(
+            "patch_features must have shape [B, L, D] or [B, levels, L, D]"
+        )
     patch_anomaly_scores = 100.0 * torch.matmul(patch_features, epoch_text_feature)
     B, L, C = patch_anomaly_scores.shape
     H = int(np.sqrt(L))
@@ -332,6 +357,25 @@ def calculate_patch_image_probability(
     """
     if temperature <= 0:
         raise ValueError("temperature must be positive")
+    if patch_features.ndim == 4:
+        if patch_features.shape[1] == 0:
+            raise ValueError("patch_features must contain at least one level")
+        level_scores = [
+            calculate_patch_image_probability(
+                patch_features[:, level],
+                text_embeddings,
+                temperature=temperature,
+                aggregation=aggregation,
+                topk_ratio=topk_ratio,
+                quantile=quantile,
+            )
+            for level in range(patch_features.shape[1])
+        ]
+        return torch.stack(level_scores, dim=0).mean(dim=0)
+    if patch_features.ndim != 3:
+        raise ValueError(
+            "patch_features must have shape [B, L, D] or [B, levels, L, D]"
+        )
     features = F.normalize(patch_features, dim=-1)
     if text_embeddings.ndim == 2:
         text = F.normalize(text_embeddings, dim=0)
