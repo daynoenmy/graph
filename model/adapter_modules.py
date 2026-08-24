@@ -26,6 +26,43 @@ class SimpleProj(nn.Module):
         return x
 
 
+class ResidualBottleneckHead(nn.Module):
+    """Parameter-efficient residual adaptation in the CLIP embedding space.
+
+    The last projection is initialized to zero, so the head is exactly an
+    identity mapping at initialization and starts from the pretrained CLIP
+    image embedding instead of replacing it with a randomly initialized head.
+    """
+
+    def __init__(self, dim=768, hidden_dim=128, dropout=0.1, residual_scale=1.0):
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if residual_scale < 0.0:
+            raise ValueError("residual_scale must be non-negative")
+
+        self.norm = nn.LayerNorm(dim)
+        self.down = nn.Linear(dim, hidden_dim, bias=False)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.up = nn.Linear(hidden_dim, dim, bias=False)
+        self.residual_scale = residual_scale
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.norm.reset_parameters()
+        nn.init.xavier_uniform_(self.down.weight)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        residual = self.up(
+            self.dropout(self.activation(self.down(self.norm(x))))
+        )
+        return x + self.residual_scale * residual
+
+
 def _build_knn_patch_graph(patch_features, k=8):
     x = F.normalize(patch_features, dim=-1)
     sim = x @ x.transpose(1, 2)
