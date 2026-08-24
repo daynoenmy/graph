@@ -110,7 +110,8 @@ def get_predictions(
                 quantile=image_quantile,
             )
         preds_image.append(pred.cpu().numpy())
-        # patch_features: (bs, patch_num, 768), already fused across the 4 levels
+        # patch_features: (bs, num_levels, patch_num, 768). Each level produces
+        # its own localization map; calculate_similarity_map averages the maps.
         patch_pred = calculate_similarity_map(
             patch_features,
             localization_text_embeddings,
@@ -306,6 +307,20 @@ def main():
             "This checkpoint was trained with a different classification text "
             "branch. Retrain with a new --save_path or use "
             "--image_score_source patch."
+        )
+    if checkpoint.get("localization_fusion") != "multilevel_score_mean_v2":
+        raise ValueError(
+            "This checkpoint was trained with feature-level localization "
+            "fusion. Retrain with a new --save_path before testing multilevel "
+            "score fusion."
+        )
+    requested_patch_graph_config = model.patch_graph_config()
+    if checkpoint.get("patch_graph_config") != requested_patch_graph_config:
+        raise ValueError(
+            "Checkpoint Patch Graph configuration "
+            f"{checkpoint.get('patch_graph_config')} does not match "
+            f"{requested_patch_graph_config}. Use the training-time Graph "
+            "arguments."
         )
     requested_det_head_config = {
         "hidden_dim": args.det_hidden_dim,
