@@ -314,6 +314,14 @@ def main():
             "fusion. Retrain with a new --save_path before testing multilevel "
             "score fusion."
         )
+    if (
+        checkpoint.get("localization_training")
+        != "multilevel_deep_supervision_v1"
+    ):
+        raise ValueError(
+            "This checkpoint was trained without multilevel deep supervision. "
+            "Retrain with a new --save_path before testing this experiment."
+        )
     requested_patch_graph_config = model.patch_graph_config()
     if checkpoint.get("patch_graph_config") != requested_patch_graph_config:
         raise ValueError(
