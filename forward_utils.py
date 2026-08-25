@@ -253,40 +253,20 @@ def get_classification_text_embedding(model, dataset_name, device):
 
 
 # ================================================================================================
-def calculate_similarity_map(
+def _calculate_single_level_similarity_map(
     patch_features, epoch_text_feature, img_size, test=False, domain="Medical"
 ):
-    """Create a localization map, averaging maps rather than level features.
-
-    A 4-D input has shape [B, num_levels, num_patches, embedding_dim]. Each
-    level is independently compared with the text anchors and converted into
-    the same training probability map or test anomaly map. Equal-weight score
-    fusion avoids cancelling small lesions in the embedding space.
-    """
-    if patch_features.ndim == 4:
-        if patch_features.shape[1] == 0:
-            raise ValueError("patch_features must contain at least one level")
-        level_predictions = [
-            calculate_similarity_map(
-                patch_features[:, level],
-                epoch_text_feature,
-                img_size,
-                test=test,
-                domain=domain,
-            )
-            for level in range(patch_features.shape[1])
-        ]
-        return torch.stack(level_predictions, dim=0).mean(dim=0)
     if patch_features.ndim != 3:
-        raise ValueError(
-            "patch_features must have shape [B, L, D] or [B, levels, L, D]"
-        )
+        raise ValueError("patch_features must have shape [B, L, D]")
     patch_anomaly_scores = 100.0 * torch.matmul(patch_features, epoch_text_feature)
     B, L, C = patch_anomaly_scores.shape
     H = int(np.sqrt(L))
+    if H * H != L:
+        raise ValueError("the patch count must form a square spatial grid")
     patch_pred = patch_anomaly_scores.permute(0, 2, 1).view(B, C, H, H)
     if test:
-        assert C == 2
+        if C != 2:
+            raise ValueError("test localization requires two text classes")
         sigma = 1 if domain == "Industrial" else 1.5
         kernel_size = 7 if domain == "Industrial" else 9
         patch_pred = (patch_pred[:, 1] + 1 - patch_pred[:, 0]) / 2
@@ -299,6 +279,70 @@ def calculate_similarity_map(
     if not test and C > 1:
         patch_preds = torch.softmax(patch_preds, dim=1)
     return patch_preds
+
+
+def calculate_multilevel_similarity_maps(
+    patch_features,
+    epoch_text_feature,
+    img_size,
+    test=False,
+    domain="Medical",
+):
+    """Return one localization map per feature level.
+
+    Input shape is [B, num_levels, num_patches, embedding_dim]. The returned
+    tensor has shape [B, num_levels, channels, height, width], which permits
+    direct supervision of every level before score fusion.
+    """
+    if patch_features.ndim != 4:
+        raise ValueError(
+            "patch_features must have shape [B, levels, L, D]"
+        )
+    if patch_features.shape[1] == 0:
+        raise ValueError("patch_features must contain at least one level")
+    level_predictions = [
+        _calculate_single_level_similarity_map(
+            patch_features[:, level],
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+        )
+        for level in range(patch_features.shape[1])
+    ]
+    return torch.stack(level_predictions, dim=1)
+
+
+def calculate_similarity_map(
+    patch_features, epoch_text_feature, img_size, test=False, domain="Medical"
+):
+    """Create a localization map, averaging maps rather than level features.
+
+    A 4-D input has shape [B, num_levels, num_patches, embedding_dim]. Each
+    level is independently compared with the text anchors and converted into
+    the same training probability map or test anomaly map. Equal-weight score
+    fusion avoids cancelling small lesions in the embedding space.
+    """
+    if patch_features.ndim == 4:
+        level_predictions = calculate_multilevel_similarity_maps(
+            patch_features,
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+        )
+        return level_predictions.mean(dim=1)
+    if patch_features.ndim == 3:
+        return _calculate_single_level_similarity_map(
+            patch_features,
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+        )
+    raise ValueError(
+        "patch_features must have shape [B, L, D] or [B, levels, L, D]"
+    )
 
 
 def calculate_image_logits(
