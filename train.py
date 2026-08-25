@@ -25,6 +25,7 @@ from forward_utils import (
     get_adapted_single_class_text_embedding,
     get_classification_text_embedding,
     calculate_image_logits,
+    calculate_multilevel_similarity_maps,
     calculate_similarity_map,
     calculate_seg_loss,
 )
@@ -157,6 +158,7 @@ def train_image_adapter(
     classification_loss_weight: float,
     localization_loss_weight: float,
     det_temperature: float,
+    level_supervision_weight: float,
     training_setup: dict = None,
 ):
     # Keep the frozen CLIP backbone in eval mode while enabling det-head dropout.
@@ -166,6 +168,8 @@ def train_image_adapter(
         loss_list = []
         classification_loss_list = []
         localization_loss_list = []
+        fused_localization_loss_list = []
+        level_localization_loss_list = []
         for input_data in tqdm(train_loader):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
@@ -208,17 +212,33 @@ def train_image_adapter(
             classification_loss = F.cross_entropy(image_logits, label.long())
             loss = classification_loss_weight * classification_loss
             localization_loss = None
+            fused_localization_loss = None
+            level_localization_loss = None
             if has_mask.any():
                 # Graph-refined features keep their level axis:
-                # (bs, num_levels, patch_num, 768). Similarity maps are
-                # calculated independently and averaged by the utility.
-                patch_preds = calculate_similarity_map(
+                # (bs, num_levels, patch_num, 768). Supervise the fused map
+                # and every individual level so weak levels cannot rely on
+                # stronger levels to compensate after averaging.
+                level_patch_preds = calculate_multilevel_similarity_maps(
                     patch_features[has_mask],
                     localization_text_feature[has_mask],
                     img_size,
                 )
-                localization_loss = calculate_seg_loss(
-                    patch_preds, mask[has_mask]
+                valid_masks = mask[has_mask]
+                fused_patch_preds = level_patch_preds.mean(dim=1)
+                fused_localization_loss = calculate_seg_loss(
+                    fused_patch_preds, valid_masks
+                )
+                level_losses = [
+                    calculate_seg_loss(
+                        level_patch_preds[:, level], valid_masks
+                    )
+                    for level in range(level_patch_preds.shape[1])
+                ]
+                level_localization_loss = torch.stack(level_losses).mean()
+                localization_loss = (
+                    fused_localization_loss
+                    + level_supervision_weight * level_localization_loss
                 )
                 loss += localization_loss_weight * localization_loss
             localization_optimizer.zero_grad()
@@ -230,15 +250,30 @@ def train_image_adapter(
             classification_loss_list.append(classification_loss.item())
             if localization_loss is not None:
                 localization_loss_list.append(localization_loss.item())
+                fused_localization_loss_list.append(
+                    fused_localization_loss.item()
+                )
+                level_localization_loss_list.append(level_localization_loss.item())
             localization_scheduler.step()
         logger.info(
             "loss: %.6f, classification_loss: %.6f, localization_loss: %s, "
+            "fused_localization_loss: %s, level_localization_loss: %s, "
             "localization_lr: %.3e, det_lr: %.3e",
             np.mean(loss_list),
             np.mean(classification_loss_list),
             (
                 f"{np.mean(localization_loss_list):.6f}"
                 if localization_loss_list
+                else "N/A"
+            ),
+            (
+                f"{np.mean(fused_localization_loss_list):.6f}"
+                if fused_localization_loss_list
+                else "N/A"
+            ),
+            (
+                f"{np.mean(level_localization_loss_list):.6f}"
+                if level_localization_loss_list
                 else "N/A"
             ),
             localization_optimizer.param_groups[0]["lr"],
@@ -256,6 +291,11 @@ def train_image_adapter(
             "classification_branch": "residual_bottleneck_cls_v2",
             "classification_text_branch": "frozen_clip_medical_v1",
             "localization_fusion": "multilevel_score_mean_v2",
+            "localization_training": "multilevel_deep_supervision_v1",
+            "level_supervision_config": {
+                "weight": level_supervision_weight,
+                "reduction": "mean",
+            },
             "patch_graph_config": model.patch_graph_config(),
             "det_head_config": {
                 "hidden_dim": det_head.down.out_features,
@@ -393,6 +433,12 @@ def main():
     parser.add_argument("--image_adapt_until", type=int, default=6)
     parser.add_argument("--classification_loss_weight", type=float, default=1.0)
     parser.add_argument("--localization_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--level_supervision_weight",
+        type=float,
+        default=0.5,
+        help="weight of the mean per-level segmentation loss",
+    )
     parser.add_argument("--det_temperature", type=float, default=100.0)
     parser.add_argument("--det_hidden_dim", type=int, default=128)
     parser.add_argument("--det_dropout", type=float, default=0.1)
@@ -408,6 +454,8 @@ def main():
         parser.error("--classification_loss_weight must be non-negative")
     if args.localization_loss_weight < 0:
         parser.error("--localization_loss_weight must be non-negative")
+    if args.level_supervision_weight < 0:
+        parser.error("--level_supervision_weight must be non-negative")
     if args.det_temperature <= 0:
         parser.error("--det_temperature must be positive")
     if args.image_lr <= 0:
@@ -560,6 +608,28 @@ def main():
                 "The existing image checkpoint was trained with feature-level "
                 "localization fusion. Use a new --save_path for the multilevel "
                 "score-fusion experiment."
+            )
+        if (
+            checkpoint.get("localization_training")
+            != "multilevel_deep_supervision_v1"
+        ):
+            raise ValueError(
+                "The existing image checkpoint was trained without multilevel "
+                "deep supervision. Use a new --save_path."
+            )
+        requested_level_supervision_config = {
+            "weight": args.level_supervision_weight,
+            "reduction": "mean",
+        }
+        if (
+            checkpoint.get("level_supervision_config")
+            != requested_level_supervision_config
+        ):
+            raise ValueError(
+                "The existing image checkpoint deep-supervision configuration "
+                f"{checkpoint.get('level_supervision_config')} does not match "
+                f"{requested_level_supervision_config}. Use matching arguments "
+                "or a new --save_path."
             )
         requested_patch_graph_config = model.patch_graph_config()
         if checkpoint.get("patch_graph_config") != requested_patch_graph_config:
@@ -733,6 +803,7 @@ def main():
         start_epoch=image_start_epoch,
         save_path=args.save_path,
         img_size=args.img_size,
+        level_supervision_weight=args.level_supervision_weight,
         logger=logger,
         default_dataset_name=args.dataset,
         classification_loss_weight=args.classification_loss_weight,
