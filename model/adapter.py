@@ -20,9 +20,10 @@ class AdaptedCLIP(nn.Module):
         levels: list = [6, 12, 18, 24],
         relu: bool = True,
         enable_patch_graph: bool = True,
-        patch_graph_k: int = 8,
-        patch_graph_alpha: float = 0.7,
-        patch_graph_residual_weight: float = 0.7,
+        patch_graph_k: int = 4,
+        patch_graph_alpha: float = 0.5,
+        patch_graph_residual_weight: float = 0.2,
+        patch_graph_temperature: float = 0.1,
         patch_graph_use_spatial: bool = True,
         det_hidden_dim: int = 128,
         det_dropout: float = 0.1,
@@ -60,6 +61,7 @@ class AdaptedCLIP(nn.Module):
                 alpha=patch_graph_alpha,
                 residual_weight=patch_graph_residual_weight,
                 use_spatial=patch_graph_use_spatial,
+                temperature=patch_graph_temperature,
                 # all seg levels join the same big graph
                 num_levels=len(levels),
             )
@@ -90,6 +92,10 @@ class AdaptedCLIP(nn.Module):
         # The generic Xavier pass above would overwrite the zero-initialized
         # residual output projection, so restore the identity initialization.
         self.image_adapter["det_head"].reset_parameters()
+        # Graph-V2 starts from an identity message projection and a constant
+        # gate. Restore those initializations after the generic Xavier pass.
+        if self.enable_patch_graph:
+            self.image_adapter["patch_graph"].reset_parameters()
 
     def image_trainable_parameters(self):
         yield from self.image_adapter.parameters()
@@ -112,9 +118,12 @@ class AdaptedCLIP(nn.Module):
         patch_graph = self.image_adapter["patch_graph"]
         config.update(
             {
+                "version": "weighted_adaptive_v2",
                 "k": patch_graph.k,
                 "alpha": patch_graph.alpha,
                 "residual_weight": patch_graph.residual_weight,
+                "temperature": patch_graph.temperature,
+                "gate_hidden_dim": patch_graph.gate_hidden_dim,
                 "use_spatial": patch_graph.use_spatial,
             }
         )
