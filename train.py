@@ -398,9 +398,30 @@ def main():
     parser.add_argument("--det_dropout", type=float, default=0.1)
     parser.add_argument("--det_residual_scale", type=float, default=1.0)
     parser.add_argument("--disable_patch_graph", action="store_true", help="disable patch-level graph refinement")
-    parser.add_argument("--patch_graph_k", type=int, default=8)
-    parser.add_argument("--patch_graph_alpha", type=float, default=0.7)
-    parser.add_argument("--patch_graph_residual_weight", type=float, default=0.7)
+    parser.add_argument(
+        "--patch_graph_k",
+        type=int,
+        default=4,
+        help="number of real (non-self) semantic neighbours in Graph-V2",
+    )
+    parser.add_argument(
+        "--patch_graph_alpha",
+        type=float,
+        default=0.5,
+        help="semantic-edge weight; spatial edges use 1-alpha",
+    )
+    parser.add_argument(
+        "--patch_graph_residual_weight",
+        type=float,
+        default=0.2,
+        help="initial value of the adaptive per-patch Graph-V2 gate",
+    )
+    parser.add_argument(
+        "--patch_graph_temperature",
+        type=float,
+        default=0.1,
+        help="positive softmax temperature for cosine-weighted graph edges",
+    )
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
@@ -422,6 +443,14 @@ def main():
         parser.error("--det_dropout must be in [0, 1)")
     if args.det_residual_scale < 0:
         parser.error("--det_residual_scale must be non-negative")
+    if args.patch_graph_k <= 0:
+        parser.error("--patch_graph_k must be positive")
+    if not 0.0 <= args.patch_graph_alpha <= 1.0:
+        parser.error("--patch_graph_alpha must be in [0, 1]")
+    if not 0.0 < args.patch_graph_residual_weight < 1.0:
+        parser.error("--patch_graph_residual_weight must be in (0, 1)")
+    if args.patch_graph_temperature <= 0.0:
+        parser.error("--patch_graph_temperature must be positive")
     if args.leave_out is not None:
         if len(args.datasets) != len(set(args.datasets)):
             parser.error("--datasets must not contain duplicates")
@@ -500,6 +529,7 @@ def main():
         det_hidden_dim=args.det_hidden_dim,
         det_dropout=args.det_dropout,
         det_residual_scale=args.det_residual_scale,
+        patch_graph_temperature=args.patch_graph_temperature,
     ).to(device)
     model.eval()
     # set optimizer
