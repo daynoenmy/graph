@@ -25,6 +25,7 @@ class AdaptedCLIP(nn.Module):
         patch_graph_residual_weight: float = 0.2,
         patch_graph_temperature: float = 0.1,
         patch_graph_use_spatial: bool = True,
+        patch_graph_gate_source: str = "pre_projection",
         det_hidden_dim: int = 128,
         det_dropout: float = 0.1,
         det_residual_scale: float = 1.0,
@@ -62,6 +63,7 @@ class AdaptedCLIP(nn.Module):
                 residual_weight=patch_graph_residual_weight,
                 use_spatial=patch_graph_use_spatial,
                 temperature=patch_graph_temperature,
+                gate_source=patch_graph_gate_source,
                 # all seg levels join the same big graph
                 num_levels=len(levels),
             )
@@ -116,17 +118,26 @@ class AdaptedCLIP(nn.Module):
         if not self.enable_patch_graph:
             return config
         patch_graph = self.image_adapter["patch_graph"]
-        config.update(
-            {
-                "version": "weighted_adaptive_v2",
-                "k": patch_graph.k,
-                "alpha": patch_graph.alpha,
-                "residual_weight": patch_graph.residual_weight,
-                "temperature": patch_graph.temperature,
-                "gate_hidden_dim": patch_graph.gate_hidden_dim,
-                "use_spatial": patch_graph.use_spatial,
-            }
-        )
+        graph_config = {
+            "k": patch_graph.k,
+            "alpha": patch_graph.alpha,
+            "residual_weight": patch_graph.residual_weight,
+            "temperature": patch_graph.temperature,
+            "gate_hidden_dim": patch_graph.gate_hidden_dim,
+            "use_spatial": patch_graph.use_spatial,
+        }
+        if patch_graph.gate_source == "post_projection":
+            # Keep the same keys and values as Graph-V2 checkpoints so old
+            # weights remain directly testable.
+            graph_config["version"] = "weighted_adaptive_v2"
+        else:
+            graph_config.update(
+                {
+                    "version": "reliability_gated_v3",
+                    "gate_source": patch_graph.gate_source,
+                }
+            )
+        config.update(graph_config)
         return config
 
     def text_trainable_parameters(self):

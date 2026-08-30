@@ -21,7 +21,7 @@ from forward_utils import (
     get_classification_text_embedding,
     calculate_image_probability,
     calculate_patch_image_probability,
-    calculate_similarity_map,
+    calculate_multilevel_similarity_maps,
     metrics_eval,
     visualize,
 )
@@ -68,6 +68,8 @@ def get_predictions(
     image_topk_ratio: float = 0.01,
     image_quantile: float = 0.99,
     image_temperature: float = 1.0,
+    pixel_score_mode: str = "margin",
+    pixel_level_index: int = None,
 ):
     masks = []
     labels = []
@@ -110,15 +112,24 @@ def get_predictions(
                 quantile=image_quantile,
             )
         preds_image.append(pred.cpu().numpy())
-        # patch_features: (bs, num_levels, patch_num, 768). Each level produces
-        # its own localization map; calculate_similarity_map averages the maps.
-        patch_pred = calculate_similarity_map(
+        # Preserve the level axis through scoring. Selecting one level is a
+        # test-only diagnostic and does not change the Graph-V2 checkpoint.
+        level_patch_preds = calculate_multilevel_similarity_maps(
             patch_features,
             localization_text_embeddings,
             img_size,
             test=True,
             domain=DOMAINS[dataset],
+            test_score_mode=pixel_score_mode,
         )
+        if pixel_level_index is None:
+            patch_pred = level_patch_preds.mean(dim=1)
+        else:
+            if not 0 <= pixel_level_index < level_patch_preds.shape[1]:
+                raise ValueError(
+                    "pixel_level_index is outside the available feature levels"
+                )
+            patch_pred = level_patch_preds[:, pixel_level_index]
         preds.append(patch_pred.cpu().numpy())
     masks = np.concatenate(masks, axis=0)
     labels = np.concatenate(labels, axis=0)
@@ -198,6 +209,25 @@ def main():
         default=1.0,
         help="positive scale applied to patch/text cosine logits",
     )
+    parser.add_argument(
+        "--pixel_score_mode",
+        type=str,
+        default="margin",
+        choices=["probability", "margin"],
+        help=(
+            "probability matches the localization training objective; "
+            "margin reproduces the legacy Graph-V2 test score"
+        ),
+    )
+    parser.add_argument(
+        "--pixel_level",
+        type=str,
+        default="mean",
+        help=(
+            "mean fuses all localization levels; otherwise provide one "
+            "Transformer level such as 6, 12, 18, or 24"
+        ),
+    )
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
@@ -237,6 +267,16 @@ def main():
         type=float,
         default=0.1,
         help="positive softmax temperature for cosine-weighted graph edges",
+    )
+    parser.add_argument(
+        "--patch_graph_gate_source",
+        type=str,
+        default="pre_projection",
+        choices=["pre_projection", "post_projection"],
+        help=(
+            "feature used to estimate the adaptive graph gate; "
+            "pre_projection is Graph-V3 and post_projection reproduces Graph-V2"
+        ),
     )
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
@@ -302,6 +342,7 @@ def main():
         det_dropout=args.det_dropout,
         det_residual_scale=args.det_residual_scale,
         patch_graph_temperature=args.patch_graph_temperature,
+        patch_graph_gate_source=args.patch_graph_gate_source,
     ).to(device)
     model.eval()
     # load checkpoints if exists
@@ -377,6 +418,24 @@ def main():
     model.image_adapter.load_state_dict(checkpoint["image_adapter"], strict=False)
     test_epoch = checkpoint["epoch"]
 
+    if args.pixel_level == "mean":
+        pixel_level_index = None
+        pixel_level_description = "mean"
+    else:
+        try:
+            requested_pixel_level = int(args.pixel_level)
+        except ValueError as error:
+            raise ValueError(
+                "--pixel_level must be 'mean' or an integer Transformer level"
+            ) from error
+        if requested_pixel_level not in model.levels:
+            raise ValueError(
+                f"--pixel_level {requested_pixel_level} is unavailable; "
+                f"choose one of {model.levels} or 'mean'"
+            )
+        pixel_level_index = model.levels.index(requested_pixel_level)
+        pixel_level_description = str(requested_pixel_level)
+
     text_file = glob(args.save_path + "/text_adapter.pth")
     if len(text_file) > 0:
         text_checkpoint = torch.load(text_file[0], map_location=device)
@@ -397,6 +456,11 @@ def main():
     logger.info("-----------------------------------------------")
     logger.info("load model from epoch %d", test_epoch)
     logger.info("training setup: %s", training_setup)
+    logger.info(
+        "pixel evaluation: score_mode=%s, level=%s",
+        args.pixel_score_mode,
+        pixel_level_description,
+    )
     logger.info("-----------------------------------------------")
     # ========================================================
     # load dataset
@@ -470,6 +534,8 @@ def main():
                 image_topk_ratio=args.image_topk_ratio,
                 image_quantile=args.image_quantile,
                 image_temperature=args.image_temperature,
+                pixel_score_mode=args.pixel_score_mode,
+                pixel_level_index=pixel_level_index,
             )
         # ========================================================
         if args.visualize:

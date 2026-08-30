@@ -186,6 +186,7 @@ class PatchGraphBlock(nn.Module):
         num_levels=1,
         temperature=0.1,
         gate_hidden_dim=64,
+        gate_source="pre_projection",
     ):
         super().__init__()
         if k <= 0:
@@ -198,6 +199,11 @@ class PatchGraphBlock(nn.Module):
             raise ValueError("temperature must be positive")
         if gate_hidden_dim <= 0:
             raise ValueError("gate_hidden_dim must be positive")
+        if gate_source not in {"pre_projection", "post_projection"}:
+            raise ValueError(
+                "gate_source must be either 'pre_projection' or "
+                "'post_projection'"
+            )
         self.k = k
         self.alpha = alpha
         if num_levels <= 0:
@@ -207,6 +213,7 @@ class PatchGraphBlock(nn.Module):
         self.num_levels = num_levels
         self.temperature = temperature
         self.gate_hidden_dim = gate_hidden_dim
+        self.gate_source = gate_source
         self.proj = nn.Linear(dim, dim, bias=False)
         self.norm = nn.LayerNorm(dim)
         self.gate_down = nn.Linear(dim, gate_hidden_dim, bias=False)
@@ -277,11 +284,19 @@ class PatchGraphBlock(nn.Module):
         # Work with unit-length features so the learned gate controls direction
         # mixing rather than being dominated by feature-norm differences.
         patch_features = F.normalize(patch_features, dim=-1)
-        graph_features = adj @ patch_features
+        graph_message = adj @ patch_features
         graph_features = F.normalize(
-            self.norm(self.proj(graph_features)), dim=-1
+            self.norm(self.proj(graph_message)), dim=-1
         )
-        disagreement = torch.abs(patch_features - graph_features)
+        # Graph-V3 estimates neighbourhood reliability before the learned
+        # projection. This prevents projection rotation from being conflated
+        # with disagreement between a patch and its neighbours. The legacy
+        # post-projection path is retained for exact Graph-V2 reproduction.
+        if self.gate_source == "pre_projection":
+            gate_reference = F.normalize(graph_message, dim=-1)
+        else:
+            gate_reference = graph_features
+        disagreement = torch.abs(patch_features - gate_reference)
         gate = torch.sigmoid(
             self.gate_up(
                 self.gate_activation(self.gate_down(disagreement))

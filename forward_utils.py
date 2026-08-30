@@ -253,52 +253,126 @@ def get_classification_text_embedding(model, dataset_name, device):
 
 
 # ================================================================================================
-def calculate_similarity_map(
-    patch_features, epoch_text_feature, img_size, test=False, domain="Medical"
+def _calculate_single_level_similarity_map(
+    patch_features,
+    epoch_text_feature,
+    img_size,
+    test=False,
+    domain="Medical",
+    test_score_mode="margin",
 ):
-    """Create a localization map, averaging maps rather than level features.
-
-    A 4-D input has shape [B, num_levels, num_patches, embedding_dim]. Each
-    level is independently compared with the text anchors and converted into
-    the same training probability map or test anomaly map. Equal-weight score
-    fusion avoids cancelling small lesions in the embedding space.
-    """
-    if patch_features.ndim == 4:
-        if patch_features.shape[1] == 0:
-            raise ValueError("patch_features must contain at least one level")
-        level_predictions = [
-            calculate_similarity_map(
-                patch_features[:, level],
-                epoch_text_feature,
-                img_size,
-                test=test,
-                domain=domain,
-            )
-            for level in range(patch_features.shape[1])
-        ]
-        return torch.stack(level_predictions, dim=0).mean(dim=0)
+    """Convert one patch-feature level into a localization map."""
     if patch_features.ndim != 3:
+        raise ValueError("patch_features must have shape [B, L, D]")
+    if test_score_mode not in {"margin", "probability"}:
         raise ValueError(
-            "patch_features must have shape [B, L, D] or [B, levels, L, D]"
+            "test_score_mode must be either 'margin' or 'probability'"
         )
     patch_anomaly_scores = 100.0 * torch.matmul(patch_features, epoch_text_feature)
     B, L, C = patch_anomaly_scores.shape
     H = int(np.sqrt(L))
+    if H * H != L:
+        raise ValueError("the patch count must form a square spatial grid")
     patch_pred = patch_anomaly_scores.permute(0, 2, 1).view(B, C, H, H)
-    if test:
-        assert C == 2
-        sigma = 1 if domain == "Industrial" else 1.5
-        kernel_size = 7 if domain == "Industrial" else 9
-        patch_pred = (patch_pred[:, 1] + 1 - patch_pred[:, 0]) / 2
-        patch_pred = gaussian_blur2d(
-            patch_pred.unsqueeze(1), (kernel_size, kernel_size), (sigma, sigma)
+
+    if not test:
+        patch_preds = F.interpolate(
+            patch_pred, size=img_size, mode="bilinear", align_corners=True
         )
-    patch_preds = F.interpolate(
-        patch_pred, size=img_size, mode="bilinear", align_corners=True
+        if C > 1:
+            patch_preds = torch.softmax(patch_preds, dim=1)
+        return patch_preds
+
+    if C != 2:
+        raise ValueError("test localization requires two text classes")
+    sigma = 1 if domain == "Industrial" else 1.5
+    kernel_size = 7 if domain == "Industrial" else 9
+    if test_score_mode == "margin":
+        # Preserve the pre-existing Graph-V2 evaluation for reproducibility.
+        anomaly_map = (patch_pred[:, 1] + 1 - patch_pred[:, 0]) / 2
+        anomaly_map = gaussian_blur2d(
+            anomaly_map.unsqueeze(1),
+            (kernel_size, kernel_size),
+            (sigma, sigma),
+        )
+        return F.interpolate(
+            anomaly_map, size=img_size, mode="bilinear", align_corners=True
+        )
+
+    # Binary softmax(abnormal) equals sigmoid(abnormal-normal), matching the
+    # probability representation optimized by the segmentation loss.
+    anomaly_logit = patch_pred[:, 1:2] - patch_pred[:, 0:1]
+    anomaly_logit = F.interpolate(
+        anomaly_logit, size=img_size, mode="bilinear", align_corners=True
     )
-    if not test and C > 1:
-        patch_preds = torch.softmax(patch_preds, dim=1)
-    return patch_preds
+    anomaly_probability = torch.sigmoid(anomaly_logit)
+    return gaussian_blur2d(
+        anomaly_probability,
+        (kernel_size, kernel_size),
+        (sigma, sigma),
+    )
+
+
+def calculate_multilevel_similarity_maps(
+    patch_features,
+    epoch_text_feature,
+    img_size,
+    test=False,
+    domain="Medical",
+    test_score_mode="margin",
+):
+    """Return one localization map per feature level."""
+    if patch_features.ndim != 4:
+        raise ValueError(
+            "patch_features must have shape [B, levels, L, D]"
+        )
+    if patch_features.shape[1] == 0:
+        raise ValueError("patch_features must contain at least one level")
+    level_predictions = [
+        _calculate_single_level_similarity_map(
+            patch_features[:, level],
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+            test_score_mode=test_score_mode,
+        )
+        for level in range(patch_features.shape[1])
+    ]
+    return torch.stack(level_predictions, dim=1)
+
+
+def calculate_similarity_map(
+    patch_features,
+    epoch_text_feature,
+    img_size,
+    test=False,
+    domain="Medical",
+    test_score_mode="margin",
+):
+    """Create a localization map by averaging independently scored levels."""
+    if patch_features.ndim == 4:
+        level_predictions = calculate_multilevel_similarity_maps(
+            patch_features,
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+            test_score_mode=test_score_mode,
+        )
+        return level_predictions.mean(dim=1)
+    if patch_features.ndim == 3:
+        return _calculate_single_level_similarity_map(
+            patch_features,
+            epoch_text_feature,
+            img_size,
+            test=test,
+            domain=domain,
+            test_score_mode=test_score_mode,
+        )
+    raise ValueError(
+        "patch_features must have shape [B, L, D] or [B, levels, L, D]"
+    )
 
 
 def calculate_image_logits(

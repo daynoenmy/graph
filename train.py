@@ -422,6 +422,16 @@ def main():
         default=0.1,
         help="positive softmax temperature for cosine-weighted graph edges",
     )
+    parser.add_argument(
+        "--patch_graph_gate_source",
+        type=str,
+        default="pre_projection",
+        choices=["pre_projection", "post_projection"],
+        help=(
+            "feature used to estimate the adaptive graph gate; "
+            "pre_projection is Graph-V3 and post_projection reproduces Graph-V2"
+        ),
+    )
     parser.add_argument("--disable_patch_graph_spatial", action="store_true", help="disable spatial edges in patch graph")
 
     args = parser.parse_args()
@@ -530,6 +540,7 @@ def main():
         det_dropout=args.det_dropout,
         det_residual_scale=args.det_residual_scale,
         patch_graph_temperature=args.patch_graph_temperature,
+        patch_graph_gate_source=args.patch_graph_gate_source,
     ).to(device)
     model.eval()
     # set optimizer

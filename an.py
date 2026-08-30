@@ -888,6 +888,7 @@ def main():
         patch_graph_alpha=args.patch_graph_alpha,
         patch_graph_residual_weight=args.patch_graph_residual_weight,
         patch_graph_use_spatial=not args.disable_patch_graph_spatial,
+        patch_graph_gate_source="post_projection",
         patch_graph_feature_temperature=args.patch_graph_feature_temperature,
         patch_graph_anomaly_temperature=args.patch_graph_anomaly_temperature,
     ).to(device)
