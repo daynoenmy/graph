@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="628" viewBox="0 0 1200 628">
+<title>Performance comparison across Brain, Liver, and RESC</title>
+<desc>Table comparing ten methods. Our method is highlighted and bolded.</desc>
+<style>text{font-family:Georgia,"Times New Roman",serif;fill:#222}.title{font-size:24px;font-weight:700}.header{font-size:22px;font-weight:700}.method{font-size:20px}.value{font-size:20px}.our{font-weight:700}.stripe{fill:#f2f2f2}.rule{stroke:#222;stroke-width:2}.minor-rule{stroke:#777;stroke-width:1}</style>
+<text x="600.0" y="38" text-anchor="middle" class="title">Performance comparison across evaluated datasets</text>
+<line x1="0" y1="98" x2="1200" y2="98" class="rule"/>
+<rect x="0" y="98" width="1200" height="58" fill="#ffffff"/>
+<text x="175.0" y="135" text-anchor="middle" class="header">Methods</text>
+<text x="492.5" y="135" text-anchor="middle" class="header">Brain</text>
+<text x="777.5" y="135" text-anchor="middle" class="header">Liver</text>
+<text x="1060.0" y="135" text-anchor="middle" class="header">RESC</text>
+<line x1="0" y1="156" x2="1200" y2="156" class="minor-rule"/>
+<text x="18" y="186" class="method">WinCLIP</text>
+<text x="492.5" y="186" text-anchor="middle" class="value">39.89</text>
+<text x="777.5" y="186" text-anchor="middle" class="value">65.04</text>
+<text x="1060.0" y="186" text-anchor="middle" class="value">57.58</text>
+<rect x="0" y="202" width="1200" height="46" class="stripe"/>
+<text x="18" y="232" class="method">APRIL-GAN</text>
+<text x="492.5" y="232" text-anchor="middle" class="value">89.53</text>
+<text x="777.5" y="232" text-anchor="middle" class="value">94.16</text>
+<text x="1060.0" y="232" text-anchor="middle" class="value">81.83</text>
+<text x="18" y="278" class="method">AnoCLIP</text>
+<text x="492.5" y="278" text-anchor="middle" class="value">87.63</text>
+<text x="777.5" y="278" text-anchor="middle" class="value">96.62</text>
+<text x="1060.0" y="278" text-anchor="middle" class="value">89.54</text>
+<rect x="0" y="294" width="1200" height="46" class="stripe"/>
+<text x="18" y="324" class="method">MVFA</text>
+<text x="492.5" y="324" text-anchor="middle" class="value">90.30</text>
+<text x="777.5" y="324" text-anchor="middle" class="value">96.86</text>
+<text x="1060.0" y="324" text-anchor="middle" class="value">87.29</text>
+<text x="18" y="370" class="method">VCPCLIP</text>
+<text x="492.5" y="370" text-anchor="middle" class="value">90.69</text>
+<text x="777.5" y="370" text-anchor="middle" class="value">95.47</text>
+<text x="1060.0" y="370" text-anchor="middle" class="value">90.34</text>
+<rect x="0" y="386" width="1200" height="46" class="stripe"/>
+<text x="18" y="416" class="method">AdaCLIP</text>
+<text x="492.5" y="416" text-anchor="middle" class="value">85.76</text>
+<text x="777.5" y="416" text-anchor="middle" class="value">91.47</text>
+<text x="1060.0" y="416" text-anchor="middle" class="value">71.15</text>
+<text x="18" y="462" class="method">UniVAD</text>
+<text x="492.5" y="462" text-anchor="middle" class="value">95.42</text>
+<text x="777.5" y="462" text-anchor="middle" class="value">96.20</text>
+<text x="1060.0" y="462" text-anchor="middle" class="value">95.72</text>
+<rect x="0" y="478" width="1200" height="46" class="stripe"/>
+<text x="18" y="508" class="method">AA-CLIP</text>
+<text x="492.5" y="508" text-anchor="middle" class="value">93.53</text>
+<text x="777.5" y="508" text-anchor="middle" class="value">96.49</text>
+<text x="1060.0" y="508" text-anchor="middle" class="value">97.02</text>
+<text x="18" y="554" class="method">AF-CLIP</text>
+<text x="492.5" y="554" text-anchor="middle" class="value">92.82</text>
+<text x="777.5" y="554" text-anchor="middle" class="value">96.04</text>
+<text x="1060.0" y="554" text-anchor="middle" class="value">92.53</text>
+<rect x="0" y="570" width="1200" height="46" class="stripe"/>
+<text x="18" y="600" class="method our">Our</text>
+<text x="492.5" y="600" text-anchor="middle" class="value our">96.50</text>
+<text x="777.5" y="600" text-anchor="middle" class="value our">97.70</text>
+<text x="1060.0" y="600" text-anchor="middle" class="value our">96.55</text>
+<line x1="0" y1="616" x2="1200" y2="616" class="rule"/>
+<line x1="0" y1="616" x2="1200" y2="616" class="rule"/>
+</svg>
