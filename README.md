@@ -4,7 +4,7 @@
 use origin/hspg
 
 ## Results
-
+![](https://github.com/daynoenmy/graph/blob/hspg/pic/line_charts_3x2.pdf)
 ## Quick Start 
 ### 1. Installation  
 ```bash
